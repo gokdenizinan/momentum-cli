@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import fcntl
 import getpass
 import json
@@ -22,12 +23,14 @@ import platform
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unicodedata
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -36,7 +39,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://momentumgrids.com"
 API_PREFIX = "/api/v1/mobile/"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 CLIENT_VERSION = f"cli-{VERSION}"
 # Refresh early so a request never races the 15-minute access-token expiry.
 REFRESH_MARGIN = timedelta(seconds=60)
@@ -61,10 +64,10 @@ class APIError(CLIError):
         self.code = code
 
 
-def urllib_transport(method, url, headers, body):
+def urllib_transport(method, url, headers, body, *, timeout=20):
     request = Request(url, data=body, method=method, headers=headers)
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=timeout) as response:
             return response.status, response.read()
     except HTTPError as error:
         return error.code, error.read()
@@ -90,6 +93,8 @@ class SessionStore:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.path = self.directory / "session.json"
+        self.lock_depth = 0
+        self.lock_owner = None
 
     def load(self):
         try:
@@ -109,11 +114,30 @@ class SessionStore:
         os.replace(temporary, self.path)
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, *, blocking=True):
+        owner = threading.get_ident()
+        if self.lock_depth and self.lock_owner == owner:
+            self.lock_depth += 1
+            try:
+                yield True
+            finally:
+                self.lock_depth -= 1
+            return
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with open(self.directory / "session.lock", "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            yield
+        with open(self.directory / "session.lock", "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
+            self.lock_depth = 1
+            self.lock_owner = owner
+            try:
+                yield True
+            finally:
+                self.lock_depth = 0
+                self.lock_owner = None
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def parse_time(value):
@@ -141,7 +165,22 @@ class Client:
             status, payload = self._send(method, path, body, query=query, token=token)
         if status >= 400:
             raise self._error(status, payload)
+        self.cache_response(method, path, query, payload)
         return payload
+
+    def cache_response(self, method, path, query, payload):
+        # Cache writes must never make an otherwise successful command fail.
+        with contextlib.suppress(Exception):
+            if method == "GET" and path == "automations/habits/":
+                self.habits = payload["habits"]
+                update_prompt_cache(self, habits=self.habits)
+            elif path == "focus/sessions/" and method == "GET" and (query or {}).get("status") == "active":
+                update_prompt_cache(self, timer=payload["sessions"][0] if payload["sessions"] else None)
+            elif path.startswith("focus/sessions/") and method == "POST" and isinstance(payload, dict):
+                if "status" in payload:
+                    update_prompt_cache(self, timer=payload if payload["status"] in ("running", "paused") else None)
+                elif path.endswith("/discard/"):
+                    update_prompt_cache(self, timer=None)
 
     def _device(self):
         # A stable device identifier makes the server reuse this terminal's
@@ -214,6 +253,7 @@ class Client:
                 self.call("DELETE", f"sessions/{saved['session_id']}/")
         with self.store.locked():
             self.store.save(self._signed_out(self.store.load()))
+            clear_prompt_cache(self.store)
 
     def _access_token(self, *, rejected=None):
         saved = self.store.load()
@@ -255,6 +295,8 @@ class Client:
 
     def _remember(self, payload, saved=None):
         saved = self.store.load() if saved is None else saved
+        if saved.get("session_id") != str(payload["session"]["id"]):
+            clear_prompt_cache(self.store)
         saved.update(
             base_url=self.base_url,
             access_token=payload["access_token"],
@@ -407,6 +449,7 @@ def watch(client, session, out):
             out.flush()
             if target and elapsed >= target:
                 print("\a\nTime's up. Save it with: momentum stop", file=out)
+                notify_done(session)
                 return
             time.sleep(1)
     except KeyboardInterrupt:
@@ -521,6 +564,9 @@ def cmd_logout(client, args, out):
 
 def cmd_tags(client, args, out):
     shown = focus_tags(client, include_archived=args.all)
+    if args.json:
+        print_json({"tags": shown}, out)
+        return
     if not shown:
         print("No focus tags yet. Create one with: momentum start <name> --new-tag", file=out)
     for tag in shown:
@@ -551,7 +597,11 @@ def start_timer(client, *, tag=None, habit=None, name=None, minutes=None):
 
 
 def change_timer(client, session, action):
-    return client.call("POST", f"focus/sessions/{session['id']}/{action}/")
+    result = client.call("POST", f"focus/sessions/{session['id']}/{action}/")
+    if action == "discard":
+        with contextlib.suppress(Exception):
+            update_prompt_cache(client, timer=None)
+    return result
 
 
 def cmd_start(client, args, out):
@@ -575,12 +625,14 @@ def cmd_start(client, args, out):
 
 def cmd_status(client, args, out):
     session = active_timer(client)
-    if session is None:
+    if args.json:
+        print_json({"session": session}, out)
+    elif session is None:
         print("No timer is running.", file=out)
     elif args.watch:
         watch(client, session, out)
     else:
-        print(timer_line(session), file=out)
+        print_lines([(timer_line(session), "accent")], args, out)
 
 
 def transition(action, verb):
@@ -630,6 +682,9 @@ def habit_line(habit):
 
 def cmd_habits(client, args, out):
     habits = today_habits(client)
+    if args.json:
+        print_json({"habits": habits}, out)
+        return
     if not habits:
         print("No active habits.", file=out)
     for habit in habits:
@@ -644,6 +699,9 @@ def set_today(client, habit, *, completed=None, value=None):
         payload = client.call("PUT", f"habits/{habit['id']}/today/numeric/", {"value": str(value)})
         habit["today"]["value"] = payload["value"]
     habit["today"]["completed"] = payload["completed"]
+    if hasattr(client, "habits"):
+        with contextlib.suppress(Exception):
+            update_prompt_cache(client, habits=client.habits)
 
 
 def numeric_value(habit, raw):
@@ -677,6 +735,775 @@ def cmd_undo(client, args, out):
     print(f"Cleared today's log for {habit['name']}.", file=out)
 
 
+PALETTES = {
+    "dark": {"normal": ("EFE6DA", 223), "secondary": ("A08C78", 137),
+             "accent": ("F0913A", 214), "gold": ("E9B949", 179),
+             "partial": ("B8692A", 130), "missed": ("7A6552", 95),
+             "frozen": ("9CC0D3", 152), "warning": ("E3826A", 173)},
+    "light": {"normal": ("2A1D12", 235), "secondary": ("6F5A47", 58),
+              "accent": ("A84E0C", 130), "gold": ("7F5700", 94),
+              "partial": ("E39D52", 179), "missed": ("9C8874", 138),
+              "frozen": ("2C6A8A", 24), "warning": ("A63E26", 124)},
+}
+DAY_STYLES = {"d": "gold", "p": "partial", "m": "missed", "f": "frozen",
+              "o": "secondary", "-": "accent"}
+
+
+def theme_name():
+    theme = os.environ.get("MOMENTUM_THEME")
+    if theme in PALETTES:
+        return theme
+    return "light" if os.environ.get("COLORFGBG", "").split(";")[-1] in ("7", "15") else "dark"
+
+
+def use_ascii(out=None):
+    if os.environ.get("MOMENTUM_ASCII") == "1":
+        return True
+    try:
+        "■".encode(getattr(out or sys.stdout, "encoding", None) or "utf-8")
+        return False
+    except (UnicodeError, LookupError):
+        return True
+
+
+class StyledText(str):
+    """A plain string with optional (cell offset, text, style) drawing spans."""
+
+    def __new__(cls, parts):
+        parts = [(clip(text, 10000), style) for text, style in parts]
+        obj = super().__new__(cls, "".join(text for text, _ in parts))
+        obj.spans = []
+        offset = 0
+        for text, style in parts:
+            obj.spans.extend((offset + x, fragment, color) for x, fragment, color in getattr(text, "spans", []))
+            if style and text:
+                obj.spans.append((offset, text, style))
+            offset += display_width(text)
+        return obj
+
+
+def day_glyph(code, *, ascii=False, monochrome=False):
+    glyphs = dict(zip("dpmfo-", "#+o*.o")) if ascii else dict(zip("dpmfo-", "■■□❄·□"))
+    # The prescribed colour glyph for partial is also a square. Give partial
+    # its own mark when colour cannot distinguish it from done.
+    if monochrome and not ascii:
+        glyphs["p"] = "+"
+    return glyphs.get(code, " ")
+
+
+def history_strip(habit, *, ascii=False, monochrome=False, days=14):
+    return StyledText([(day_glyph(code, ascii=ascii, monochrome=monochrome), DAY_STYLES.get(code))
+                       for code in (habit.get("recent_days") or "")[-days:]])
+
+
+def history_counts(habit):
+    history = (habit.get("recent_days") or "")[-112:]
+    return history.count("d"), sum(code in "dpm" for code in history), history.count("f")
+
+
+def eligible_habits(habits):
+    return [h for h in habits if h["today"]["completed"] or
+            (h["today"]["scheduled"] and not h["today"]["frozen"])]
+
+
+def today_counts(habits):
+    eligible = eligible_habits(habits)
+    return sum(bool(h["today"]["completed"]) for h in eligible), len(eligible)
+
+
+def sparkline(habits, *, ascii=False):
+    levels = "_.-=#" if ascii else "▁▂▃▄▅▆▇█"
+    totals = []
+    for offset in range(9, 0, -1):
+        codes = [(h.get("recent_days") or "")[-offset:-offset + 1 or None] for h in habits]
+        totals.append((codes.count("d"), sum(code in ("d", "p", "m", "-") for code in codes)))
+    cells = []
+    for done, total in totals:
+        if not total:
+            cells.append(" ")
+            continue
+        level = int(done / total * (4 if ascii else 8) + .5) - (0 if ascii else 1)
+        cells.append(levels[min(len(levels) - 1, max(0, level))])
+    done, total = map(sum, zip(*totals))
+    return "".join(cells), int(done / total * 100 + .5) if total else 0
+
+
+def today_mark(habit, *, ascii=False):
+    today = habit["today"]
+    if today["completed"]:
+        return ("#" if ascii else "✓"), "gold"
+    if today["frozen"]:
+        return ("*" if ascii else "❄"), "frozen"
+    if not today["scheduled"]:
+        return ("." if ascii else "·"), "secondary"
+    if Decimal(today.get("value") or "0"):
+        return "+", "partial"
+    return ("o" if ascii else "○"), "accent"
+
+
+def grid_lines(habit, today, *, ascii=False, monochrome=False):
+    """The 112 local dates occupy 17 Monday-aligned week columns."""
+    if isinstance(today, datetime):
+        today = today.date()
+    first = today - timedelta(days=111)
+    monday = first - timedelta(days=first.weekday())
+    history = (habit.get("recent_days") or "")[-112:].rjust(112)
+    done, eligible, frozen = history_counts(habit)
+    sep = " | " if ascii else " · "
+    heading = sep.join([habit["name"], "last 16 weeks", f"{done} of {eligible} days", f"{frozen} frozen"])
+    labels = list(" " * 39)
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    for offset in range(112):
+        day = first + timedelta(days=offset)
+        if day.day == 1:
+            column = 5 + (day - monday).days // 7 * 2
+            for index, char in enumerate(months[day.month - 1]):
+                if column + index < len(labels):
+                    labels[column + index] = char
+    lines = [(heading, "title"), ("".join(labels), "secondary")]
+    for weekday, label in enumerate(("Mon", "", "Wed", "", "Fri", "", "Sun")):
+        parts = [(f" {label:3} ", "secondary")]
+        for week in range(17):
+            day = monday + timedelta(days=week * 7 + weekday)
+            code = history[(day - first).days] if first <= day <= today else " "
+            parts.append((day_glyph(code, ascii=ascii, monochrome=monochrome) + " ", DAY_STYLES.get(code)))
+        lines.append((StyledText(parts), "normal"))
+    return lines
+
+
+def ansi_enabled(out, color="auto"):
+    if color == "never" or "NO_COLOR" in os.environ:
+        return False
+    return color == "always" or (out.isatty() and os.environ.get("TERM") != "dumb")
+
+
+def ansi_style(style):
+    palette = PALETTES[theme_name()]
+    if style == "tab_active":
+        return "\033[1;4m" + ansi_style("accent")
+    hex_color, index = palette.get(style, palette["normal"])
+    if style.startswith("group_"):
+        indexes = GROUP_LIGHT_INDEXES if theme_name() == "light" else GROUP_INDEXES
+        index = indexes.get(style[6:], 103)
+        level = index - 16
+        components = (level // 36, level // 6 % 6, level % 6)
+        hex_color = "".join(f"{(0, 95, 135, 175, 215, 255)[c]:02x}" for c in components)
+    if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+        rgb = ";".join(str(int(hex_color[i:i + 2], 16)) for i in (0, 2, 4))
+        return f"\033[38;2;{rgb}m"
+    return f"\033[38;5;{index}m"
+
+
+def print_lines(lines, args, out):
+    colored = ansi_enabled(out, getattr(args, "color", "auto"))
+    for line, style in lines:
+        line = clip(line, 10000)  # sanitize control characters from user names
+        if use_ascii(out):
+            line = ascii_line(line)
+        if colored:
+            # Spans use display-cell offsets, including wide habit names.
+            parts, cursor = [], 0
+            for offset, text, span_style in getattr(line, "spans", []):
+                parts.append(ansi_style(style) + cell_slice(line, cursor, offset))
+                parts.append(ansi_style(span_style) + text)
+                cursor = offset + display_width(text)
+            parts.append(ansi_style(style) + cell_slice(line, cursor, display_width(line)))
+            line = "".join(parts) + "\033[0m"
+        print(line, file=out)
+
+
+def print_json(payload, out):
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True), file=out)
+
+
+def cmd_today(client, args, out):
+    habits = today_habits(client)
+    done, total = today_counts(habits)
+    if args.json:
+        print_json({"done": done, "total": total, "habits": habits}, out)
+        return
+    state = UIState(habits=eligible_habits(habits), ascii=use_ascii(out),
+                    monochrome=not ansi_enabled(out, args.color))
+    dots = ("#" * done + "o" * (total - done)) if state.ascii else ("●" * done + "○" * (total - done))
+    lines = [(f" {datetime.now().strftime('%a %d %b')} · {done} of {total} done  {dots}", "title")]
+    lines += habit_rows(state, 99, len(state.habits), selected_detail=False, selection_marker=False)
+    excluded = [h for h in habits if h not in state.habits]
+    if excluded:
+        lines.append(("   + " + " · ".join(f"{h['name']} ({habit_detail(h)})" for h in excluded), "secondary"))
+    print_lines(lines, args, out)
+
+
+def cmd_grid(client, args, out):
+    habit = pick(today_habits(client), args.habit, "habit")
+    if args.json:
+        print_json({"habit": habit}, out)
+    else:
+        print_lines(grid_lines(habit, datetime.now().date(), ascii=use_ascii(out),
+                               monochrome=not ansi_enabled(out, args.color)), args, out)
+
+
+def fetch_year(client, year):
+    """Dashboard pages are explicit reads, never part of the regular poll."""
+    result, habits, page = None, [], 1
+    while True:
+        payload = client.call("GET", "dashboard/", query={"year": year, "page": page, "page_size": 20})
+        result = result or dict(payload)
+        habits.extend(payload["habits"])
+        if not payload["pagination"]["has_next"]:
+            break
+        page += 1
+    result["habits"] = habits
+    result["streaks"] = ({str(h["id"]): h.get("streak", 0) for h in today_habits(client)}
+                         if year == datetime.now().date().year else {})
+    return result
+
+
+def scheduled_on(habit, day):
+    # Habit.weekdays_on starts with daily scheduling before the first rule.
+    history = habit.get("schedule_history")
+    weekdays = list(range(1, 8)) if history is not None else habit.get("scheduled_weekdays", list(range(1, 8)))
+    for rule in history or []:
+        if rule["effective_from"] > day.isoformat():
+            break
+        weekdays = rule["weekdays"]
+    return day.isoweekday() in weekdays
+
+
+def year_states(habit, year, today):
+    entries = {e["date"]: e for e in habit["entries"]}
+    frozen = set(habit["frozen_dates"])
+    states, day = {}, date(year, 1, 1)
+    while day.year == year:
+        key = day.isoformat()
+        entry = entries.get(key) or {}
+        if day > today:
+            code = " "
+        elif entry.get("completed"):
+            code = "d"
+        elif key < habit["start_date"]:
+            code = "o"
+        elif Decimal(entry.get("value") or "0"):
+            code = "p"
+        elif key in frozen:
+            code = "f"
+        elif not scheduled_on(habit, day):
+            code = "o"
+        else:
+            code = "-" if day == today else "m"
+        states[day] = code
+        if day == date(year, 12, 31):
+            break
+        day += timedelta(days=1)
+    return states
+
+
+def year_stats(habit, states):
+    best = run = 0
+    months = []
+    for code in states.values():
+        if code == "d":
+            run += 1
+            best = max(best, run)
+        elif code not in ("f", "o", " "):
+            run = 0
+    for month in range(1, 13):
+        dates = [(d, s) for d, s in states.items() if d.month == month]
+        done = sum(s == "d" for _, s in dates)
+        frozen = set(habit["frozen_dates"])
+        eligible = sum(s == "d" or (s != " " and d.isoformat() >= habit["start_date"]
+                                   and scheduled_on(habit, d) and d.isoformat() not in frozen) for d, s in dates)
+        months.append({"month": month, "done": done, "eligible": eligible,
+                       "rate": round(100 * done / eligible) if eligible else 0})
+    # The server's year_summary is authoritative for eligibility (including
+    # completed off-schedule days and historical schedule changes).
+    summary = habit["year_summary"]
+    done, eligible = summary["completed_days"], summary["eligible_days"]
+    return {"done": done, "eligible": eligible, "rate": round(100 * done / eligible) if eligible else 0,
+            "best_run": best, "frozen": list(states.values()).count("f"), "months": months}
+
+
+def half_year_lines(states, year, half, *, cursor=None, ascii=False, monochrome=False):
+    first, last = date(year, half * 6 + 1, 1), date(year, half * 6 + 6, 30 if half == 0 else 31)
+    monday = first - timedelta(days=first.weekday())
+    weeks = (last - monday).days // 7 + 1
+    labels = list(" " * (4 + weeks * 2 + 2))
+    for month in range(first.month, last.month + 1):
+        start = date(year, month, 1)
+        pos = 4 + (start - monday).days // 7 * 2
+        labels[pos:pos + 3] = list(start.strftime("%b"))
+    rows = [("".join(labels).rstrip(), "secondary")]
+    for weekday in range(7):
+        parts = [(date(2026, 11, 16 + weekday).strftime("%a") + " ", "secondary")]
+        for week in range(weeks):
+            day = monday + timedelta(days=week * 7 + weekday)
+            code = states.get(day, " ") if first <= day <= last else " "
+            glyph = day_glyph(code, ascii=ascii, monochrome=monochrome)
+            parts.append((glyph + (" " if week < weeks - 1 else ""), "cursor" if day == cursor else DAY_STYLES.get(code)))
+        rows.append((StyledText(parts), "normal"))
+    return rows
+
+
+def year_stat_lines(stats, streak=None, *, ascii=False):
+    lines = [(f" {stats['done']} of {stats['eligible']} eligible days", "title"),
+             (f" {stats['rate']}% completion rate", "gold")]
+    if streak is not None:
+        lines.append((f" Streak {streak}d", "gold"))
+    lines += [(f" Best run {stats['best_run']}d", "normal"), (f" Frozen {stats['frozen']}", "frozen"), ("", "normal")]
+    for month in stats["months"]:
+        if not month["eligible"]:
+            continue  # months that haven't started (or had nothing scheduled)
+        label = date(2000, month["month"], 1).strftime("%b")
+        bar = progress_bar(month["done"], max(1, month["eligible"]), 10, ascii=ascii)
+        lines.append((f" {label} {bar} {month['rate']:3}%", "secondary"))
+    return lines
+
+
+def year_lines(habit, payload, today, *, cursor=None, width=100, height=32, ascii=False, monochrome=False):
+    year = payload["year"]
+    states = year_states(habit, year, today)
+    stats = year_stats(habit, states)
+    streak = payload.get("streaks", {}).get(str(habit["id"])) if year == today.year else None
+    halves = [0, 1] if width >= 60 else [(cursor.month - 1) // 6 if cursor else (today.month - 1) // 6]
+    grids = []
+    for half in halves:
+        if grids:
+            grids.append(("", "normal"))
+        grids += half_year_lines(states, year, half, cursor=cursor, ascii=ascii, monochrome=monochrome)
+    if width >= 96:
+        panel = year_stat_lines(stats, streak, ascii=ascii)
+        lines = []
+        for index in range(max(len(grids), len(panel))):
+            left = grids[index][0] if index < len(grids) else ""
+            right, style = panel[index] if index < len(panel) else ("", "normal")
+            lines.append((StyledText([(left, None), (" " * max(1, 61 - display_width(left)), None), (right, style)]), "normal"))
+        return lines
+    # A 40-column terminal pans to the cursor's week; one-shot output uses a
+    # full-width grid so no part of the year is lost to clipping.
+    if cursor and width < 60:
+        half = halves[0]
+        first = date(year, half * 6 + 1, 1)
+        monday = first - timedelta(days=first.weekday())
+        visible_weeks = max(1, (width - 5) // 2)
+        cursor_week = (cursor - monday).days // 7
+        start_week = max(0, cursor_week - visible_weeks + 1)
+        panned = []
+        for text, style in grids:
+            left = cell_slice(text, 0, 4)
+            # Preserve day styles and cursor spans through horizontal panning.
+            sliced = str.__new__(StyledText, left + cell_slice(text, 4 + start_week * 2, 4 + (start_week + visible_weeks) * 2))
+            sliced.spans = [(4 + offset - (4 + start_week * 2), fragment, color)
+                            for offset, fragment, color in getattr(text, "spans", [])
+                            if 4 + start_week * 2 <= offset < 4 + (start_week + visible_weeks) * 2]
+            panned.append((sliced, style))
+        grids = panned
+    summary = f" {stats['done']}/{stats['eligible']} done · {stats['rate']}%"
+    detail = (f" Streak {streak} · " if streak is not None else " ") + f"best {stats['best_run']} · frozen {stats['frozen']}"
+    return grids + [(summary, "gold"), (detail, "secondary")]
+
+
+def set_history_day(client, habit, day, *, value=None):
+    entry = next((e for e in habit["entries"] if e["date"] == day.isoformat()), {})
+    body = {"completed": not entry.get("completed", False)} if habit["habit_type"] == "binary" else {"value": str(value)}
+    return client.call("PUT", f"habits/{habit['id']}/entries/{day.isoformat()}/", body)
+
+
+def cmd_year(client, args, out):
+    year = args.year if args.year is not None else datetime.now().year
+    payload = fetch_year(client, year)
+    habit = pick(payload["habits"], args.habit, "habit")
+    today = datetime.now().date()
+    stats = year_stats(habit, year_states(habit, year, today))
+    if args.json:
+        print_json({"year": year, "habit": habit, "stats": stats,
+                    "streak": payload["streaks"].get(str(habit["id"]))}, out)
+    else:
+        print_lines([(f"{habit['name']} · {year}", "title")] +
+                    year_lines(habit, payload, today, ascii=use_ascii(out), monochrome=not ansi_enabled(out, args.color)), args, out)
+
+
+def focus_history(client, today, days):
+    sessions = []
+    cutoff = today - timedelta(days=days - 1)
+    for page in range(1, 21):
+        payload = client.call("GET", "focus/sessions/", query={"status": "completed", "page_size": 100, "page": page})
+        older = False
+        for session in payload["sessions"]:
+            ended = parse_time(session["ended_at"]).astimezone().date()
+            if ended < cutoff:
+                older = True
+                break
+            if ended <= today:
+                sessions.append(session)
+        if older or not payload["pagination"]["has_next"]:
+            return sessions, False
+    return sessions, True
+
+
+def focus_summary(sessions, today, days=7, *, timer=None, elapsed=0):
+    first = today - timedelta(days=days - 1)
+    before = first - timedelta(days=days)
+    daily = {first + timedelta(days=i): 0 for i in range(days)}
+    tags, previous = {}, 0
+    values = [(s, s["duration_seconds"], parse_time(s["ended_at"]).astimezone().date()) for s in sessions]
+    if timer:
+        values.append((timer, elapsed, today))
+    for session, seconds, day in values:
+        if before <= day < first:
+            previous += seconds
+        elif day in daily:
+            daily[day] += seconds
+            association = session["association"]
+            name = association["name"] if association["kind"] != "none" else "No tag"
+            tags[name] = tags.get(name, 0) + seconds
+    total = sum(daily.values())
+    return {"days": days, "total_seconds": total, "previous_seconds": previous, "delta_seconds": total - previous,
+            "daily": [{"date": d.isoformat(), "seconds": n} for d, n in daily.items()],
+            "tags": [{"name": name, "seconds": seconds, "percent": round(100 * seconds / total) if total else 0}
+                     for name, seconds in sorted(tags.items(), key=lambda pair: (-pair[1], pair[0]))]}
+
+
+def short_duration(seconds):
+    minutes = max(0, int(seconds)) // 60
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02}" if hours else f"{minutes}m"
+
+
+def focus_buckets(summary):
+    days = summary["daily"]
+    if summary["days"] == 7:
+        return [(date.fromisoformat(d["date"]).strftime("%a"), d["seconds"], i == 6) for i, d in enumerate(days)]
+    buckets = {}
+    for item in days:
+        day = date.fromisoformat(item["date"])
+        start = day - timedelta(days=day.weekday()) if summary["days"] == 30 else day.replace(day=1)
+        buckets[start] = buckets.get(start, 0) + item["seconds"]
+    latest = max(buckets)
+    return [(d.strftime("%d%b" if summary["days"] == 30 else "%b"), seconds, d == latest) for d, seconds in buckets.items()]
+
+
+def focus_chart(summary, width, *, rows=8, ascii=False):
+    buckets = focus_buckets(summary)
+    # Seven five-cell bars still fit at 40 columns by shedding their gaps.
+    # Longer windows pan to the latest buckets if even gapless bars won't fit.
+    gap = 3 if len(buckets) * 8 - 3 <= width else 1 if len(buckets) * 6 - 1 <= width else 0
+    buckets = buckets[-max(1, (width + gap) // (5 + gap)):]
+    maximum = max(1, max(seconds for _, seconds, _ in buckets))
+    average = sum(item["seconds"] for item in summary["daily"]) / len(focus_buckets(summary))
+    avg_row = min(rows - 1, rows - 1 - int(average / maximum * (rows - 1)))
+    lines = [(StyledText([(clip(short_duration(n), 5).center(5) + " " * gap, "accent" if current else "secondary")
+                         for _, n, current in buckets]), "normal")]
+    for row in range(rows):
+        parts = []
+        for _, seconds, current in buckets:
+            eighths = round(seconds / maximum * rows * 8)
+            level = max(0, min(8, eighths - (rows - row - 1) * 8))
+            glyph = ("#" if ascii else "▁▂▃▄▅▆▇█"[level - 1]) if level else ("-" if row == avg_row else " ")
+            # The dashed average line runs through empty space only, never through a bar.
+            cell = glyph * 5
+            parts.append((cell + ("-" if row == avg_row else " ") * gap, "accent" if current else "secondary"))
+        lines.append((StyledText(parts), "normal"))
+    lines.append((StyledText([(name.center(5) + " " * gap, "accent" if current else "secondary")
+                              for name, _, current in buckets]), "normal"))
+    lines.append((f" avg {short_duration(average)} per {'day' if summary['days'] == 7 else 'week' if summary['days'] == 30 else 'month'}", "secondary"))
+    return lines
+
+
+def write_focus_csv(sessions, out):
+    writer = csv.writer(out)
+    writer.writerow(("start", "end", "seconds", "tag_or_habit", "name", "status"))
+    for session in sessions:
+        association = session["association"]
+        writer.writerow((session["started_at"], session["ended_at"], session["duration_seconds"],
+                         association["name"] if association["kind"] != "none" else "", session["name"], session["status"]))
+
+
+def export_focus(sessions, output, out=None):
+    if output is None:
+        write_focus_csv(sessions, out or sys.stdout)
+        return
+    # A new file avoids following symlinks or silently replacing another export.
+    try:
+        descriptor = os.open(os.path.expanduser(output), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            write_focus_csv(sessions, handle)
+    except OSError as error:
+        raise CLIError(f"Could not export to {output}: {error}") from error
+
+
+def positive_days(raw):
+    value = int(raw)
+    if value < 1 or value > 36500:
+        raise argparse.ArgumentTypeError("Choose 1 to 36500 days.")
+    return value
+
+
+def cmd_export(client, args, out):
+    sessions, capped = focus_history(client, datetime.now().date(), args.days)
+    export_focus(sessions, args.output, out)
+    if capped:
+        print("Export capped at 20 pages (2000 sessions).", file=sys.stderr)
+
+
+def cmd_week(client, args, out):
+    today = datetime.now().date()
+    sessions, capped = focus_history(client, today, 14)
+    timer = active_timer(client)
+    summary = focus_summary(sessions, today, timer=timer, elapsed=timer["elapsed_seconds"] if timer else 0)
+    if args.json:
+        print_json(dict(summary, capped=capped), out)
+    else:
+        delta = summary["delta_seconds"]
+        lines = [(f"LAST 7 DAYS {short_duration(summary['total_seconds'])} focused · {'▲' if delta >= 0 else '▼'} {short_duration(abs(delta))} vs the 7 days before", "title")]
+        lines += focus_chart(summary, 100, ascii=use_ascii(out)) + [("BY TAG", "title")]
+        lines += [(f" {t['name']}  {progress_bar(t['seconds'], max(1, summary['total_seconds']), 24, ascii=use_ascii(out))}  {short_duration(t['seconds'])}  {t['percent']}%", "normal") for t in summary["tags"]]
+        if capped:
+            lines.append(("History capped at 20 pages (2000 sessions).", "warning"))
+        print_lines(lines, args, out)
+
+
+# Nearest xterm colours to the existing Kairos identities in static/css/kairos.css.
+# Light green/teal and coral reserve adjacent choices to avoid collisions with
+# another group and the Momentum orange (130).
+GROUP_INDEXES = {"blue": 111, "purple": 183, "green": 115, "rose": 211, "amber": 180,
+                 "teal": 116, "indigo": 147, "coral": 216, "olive": 150, "slate": 146}
+GROUP_LIGHT_INDEXES = {"blue": 25, "purple": 97, "green": 29, "rose": 131, "amber": 94,
+                       "teal": 23, "indigo": 61, "coral": 95, "olive": 58, "slate": 60}
+
+
+def task_sections(payload):
+    day = date.fromisoformat(payload["day"])
+    tomorrow = (day + timedelta(days=1)).isoformat()
+    sections = {"TODAY": [], "TOMORROW": [], "LATER": []}
+    for task in payload["tasks"]:
+        if task["state"] == "done":
+            completed = parse_time(task["completed_at"])
+            if completed and completed.astimezone().date() == day:
+                sections["TODAY"].append(task)
+        elif task["state"] == "open":
+            planned = task["planned_for"]
+            section = "TODAY" if planned and planned <= payload["day"] else "TOMORROW" if planned == tomorrow else "LATER"
+            sections[section].append(task)
+    for tasks in sections.values():
+        tasks.sort(key=lambda t: (t["state"] == "done", t["created_at"], t["id"]))
+    return sections
+
+
+def change_task(client, task, action, **fields):
+    return client.call("POST", f"kairos/{task['id']}/", dict(fields, action=action, version=task["version"]))
+
+
+def add_task(client, title, destination="today", *, identity=None):
+    task = client.call("POST", "kairos/", {"id": identity or str(uuid.uuid4()), "title": title})
+    # CaptureSerializer creates an unplanned task. Planning is a versioned change.
+    return task if destination == "later" else change_task(client, task, destination)
+
+
+def cmd_tasks(client, args, out):
+    payload = client.call("GET", "kairos/")
+    if args.json:
+        print_json(payload, out)
+        return
+    groups = {g["id"]: g for g in payload["groups"]}
+    lines = []
+    for section, tasks in task_sections(payload).items():
+        lines.append((section, "title"))
+        for task in tasks:
+            group = groups.get(task.get("group_id"), {})
+            mark = "✓" if task["state"] == "done" else "○"
+            reminder = parse_time(task.get("remind_at"))
+            detail = (" · " + group["name"]) if group else ""
+            detail += (" · " + reminder.astimezone().strftime("%d %b %H:%M")) if reminder else ""
+            lines.append((f" {mark} {task['title']}{detail}", "secondary" if task["state"] == "done" else "normal"))
+    print_lines(lines, args, out)
+
+
+def cmd_task(client, args, out):
+    if args.task_command == "add":
+        try:
+            task = add_task(client, args.title, "tomorrow" if args.tomorrow else "later" if args.later else "today")
+        except APIError as error:
+            if error.status == 409:
+                client.call("GET", "kairos/")
+            raise
+        print(f"Added {task['title']}.", file=out)
+    else:
+        payload = client.call("GET", "kairos/")
+        tasks = [dict(t, name=t["title"]) for t in payload["tasks"] if t["state"] == "open"]
+        task = pick(tasks, args.query, "task")
+        try:
+            change_task(client, task, "done")
+        except APIError as error:
+            if error.status == 409:
+                client.call("GET", "kairos/")
+            raise
+        print(f"Done {task['title']}.", file=out)
+
+
+_MISSING = object()
+TIMER_CACHE_KEYS = ("id", "name", "status", "association", "elapsed_seconds", "target_duration_seconds")
+
+
+def clear_prompt_cache(store):
+    with contextlib.suppress(OSError):
+        (store.directory / "prompt-cache.json").unlink()
+
+
+def load_prompt_cache(client):
+    try:
+        saved = client.store.load()
+        data = json.loads((client.store.directory / "prompt-cache.json").read_text())
+        if (data.get("base_url") == client.base_url and data.get("session_id") == saved.get("session_id")
+                and data.get("date") == datetime.now().date().isoformat()):
+            return data
+    except (OSError, ValueError, CLIError, AttributeError):
+        pass
+    return {}
+
+
+def update_prompt_cache(client, *, timer=_MISSING, habits=None):
+    store = client.store
+    store.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Separate nonblocking cache lock prevents lost updates between commands.
+    with open(store.directory / "prompt-cache.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        data = load_prompt_cache(client)
+        now = time.time()
+        if timer is not _MISSING:
+            data["timer"] = {key: timer[key] for key in TIMER_CACHE_KEYS if key in timer} if timer else None
+            data["timer_fetched_at"] = now
+        if habits is not None:
+            data["done"], data["total"] = today_counts(habits)
+            data["habits_fetched_at"] = now
+        data.update(base_url=client.base_url, session_id=store.load().get("session_id"),
+                    date=datetime.now().date().isoformat())
+        data["fetched_at"] = min(data.get("timer_fetched_at", 0), data.get("habits_fetched_at", 0))
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=store.directory, prefix=".prompt-", delete=False) as handle:
+                path = Path(handle.name)
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump(data, handle)
+            os.replace(path, store.directory / "prompt-cache.json")
+        finally:
+            if path is not None:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+
+def prompt_payload(cache):
+    session = dict(cache["timer"]) if cache.get("timer") else None
+    if session and session["status"] == "running":
+        session["elapsed_seconds"] += max(0, int(time.time() - cache["timer_fetched_at"]))
+        if session.get("target_duration_seconds"):
+            session["elapsed_seconds"] = min(session["elapsed_seconds"], session["target_duration_seconds"])
+    return {"session": session, "done": cache.get("done", 0), "total": cache.get("total", 0)}
+
+
+def print_prompt(cache, args, out):
+    if not cache:
+        return
+    payload = prompt_payload(cache)
+    if args.json:
+        print_json(payload, out)
+        return
+    session = payload["session"]
+    mark = ("*" if use_ascii(out) else "●") if session and session["status"] == "running" else ("||" if use_ascii(out) else "❚❚")
+    timer = f"{mark} {timer_title(session)}" if session else ""
+    elapsed = clock(session["elapsed_seconds"]) if session else ""
+    default = "{timer} {elapsed} · {done}/{total}" if session else "{done}/{total}"
+    text = (args.format or default).format(timer=timer, elapsed=elapsed, done=payload["done"], total=payload["total"])
+    text = clip(text, 10000)
+    if args.tmux:
+        style = "accent" if session else "gold"
+        tmux_color = args.color != "never" and "NO_COLOR" not in os.environ
+        text = ascii_line(text) if use_ascii(out) else text
+        text = text.replace("#", "##")
+        if tmux_color:
+            text = f"#[fg=colour{PALETTES[theme_name()][style][1]}]{text}#[default]"
+        print(text, file=out)
+    else:
+        print_lines([(text, "accent" if session else "gold")], args, out)
+
+
+def cmd_prompt(client, args, out):
+    cache = {}
+    try:
+        client._require_session(client.store.load())
+        cache = load_prompt_cache(client)
+        if time.time() - cache.get("fetched_at", 0) > args.max_age:
+            # Own the session lock for the entire refresh; nested token refresh
+            # uses this same lock. Never wait behind another shell command.
+            with client.store.locked(blocking=False) as acquired:
+                if acquired:
+                    deadline = time.monotonic() + 2
+                    original = client.transport
+
+                    def short_transport(method, url, headers, body):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise CLIError("Prompt refresh timed out.")
+                        if original is urllib_transport:
+                            return urllib_transport(method, url, headers, body, timeout=remaining)
+                        return original(method, url, headers, body)
+
+                    client.transport = short_transport
+                    try:
+                        active_timer(client)
+                        today_habits(client)
+                    finally:
+                        client.transport = original
+        client._require_session(client.store.load())
+        cache = load_prompt_cache(client) or cache
+    except Exception:
+        # A locally revoked session must not expose an old account's status.
+        try:
+            client._require_session(client.store.load())
+            cache = load_prompt_cache(client) or cache
+        except Exception:
+            return
+    try:
+        print_prompt(cache, args, out)
+    except Exception:
+        # Invalid custom formats still get the ordinary cached status.
+        args.format = None
+        with contextlib.suppress(Exception):
+            print_prompt(cache, args, out)
+
+
+def notify_done(session, *, enabled=None):
+    enabled = os.environ.get("MOMENTUM_NOTIFY") != "0" if enabled is None else enabled
+    if not enabled or sys.platform != "darwin":
+        return
+    script = ('on run argv', 'display notification (item 1 of argv) with title "Momentum"', 'end run')
+    command = ["osascript"]
+    for line in script:
+        command += ["-e", line]
+    text = f"Time's up · {timer_title(session)} · {clock(session['target_duration_seconds'])}"
+    with contextlib.suppress(Exception):
+        subprocess.run([*command, text], capture_output=True, timeout=2, check=False)
+
+
+def completed_today(client, today):
+    sessions, page = [], 1
+    while True:
+        payload = client.call("GET", "focus/sessions/", query={"status": "completed", "page_size": 100, "page": page})
+        older = False
+        for session in payload["sessions"]:
+            ended = parse_time(session["ended_at"]).astimezone().date()
+            if ended < today:
+                older = True
+                break
+            if ended == today:
+                sessions.append(session)
+        if older or not payload["pagination"]["has_next"]:
+            return sessions
+        page += 1
+
+
 @dataclass
 class UIState:
     """Plain presentation data; monotonic timestamps keep the local clock steady."""
@@ -696,14 +1523,58 @@ class UIState:
     minutes: str = ""
     pending_discard: dict | None = None
     discard_prompt: str = ""
+    discard_return: str | None = None
+    ascii: bool = field(default_factory=use_ascii)
+    monochrome: bool = field(default_factory=lambda: "NO_COLOR" in os.environ)
+    completed_sessions: list = field(default_factory=list)
+    completed_date: object = None
+    notify: bool = field(default_factory=lambda: os.environ.get("MOMENTUM_NOTIFY") != "0")
+    tab: int = 1
+    loaded_tabs: set = field(default_factory=lambda: {1})
+    year: int = field(default_factory=lambda: datetime.now().year)
+    years: dict = field(default_factory=dict)
+    grid_selection: int = 0
+    grid_cursor: date = field(default_factory=lambda: datetime.now().date())
+    focus_days: int = 7
+    focus_windows: dict = field(default_factory=dict)
+    tasks_payload: dict | None = None
+    task_selection: int = 0
+    input_text: str = ""
+    input_destination: int = 0
+    pending_edit: tuple | None = None
+    pending_task: dict | None = None
+    capture_id: str | None = None
 
 
 class UIApp:
-    def __init__(self, client):
+    def __init__(self, client, *, color="auto"):
         self.client = client
+        self.color = color
         self.state = UIState()
         self.last_refresh = -UI_POLL_SECONDS
         self.quit = False
+        self.last_focus_refresh = -UI_POLL_SECONDS
+        self.notified = set()
+
+    def refresh_focus(self):
+        self.last_focus_refresh = time.monotonic()
+        try:
+            today = datetime.now().date()
+            sessions = completed_today(self.client, today)
+            self.state.completed_sessions = sessions
+            self.state.completed_date = today
+        except CLIError as error:
+            self.state.status = str(error)
+
+    def check_done(self):
+        state = self.state
+        timer = state.timer
+        if (timer and timer.get("target_duration_seconds") and
+                ui_elapsed(state) >= timer["target_duration_seconds"] and timer["id"] not in self.notified):
+            self.notified.add(timer["id"])
+            notify_done(timer, enabled=state.notify)
+            return True
+        return False
 
     def refresh(self, message=None):
         """Keep the last good data on failure and throttle even failed polls."""
@@ -715,6 +1586,18 @@ class UIApp:
         except CLIError as error:
             errors.append(str(error))
         try:
+            if state.tab != 1:
+                if state.tab == 4:
+                    self.refresh_tasks()
+                self.last_refresh = state.now = time.monotonic()
+                state.date = datetime.now().astimezone()
+                if state.overlay == "focus" and state.now - self.last_focus_refresh >= UI_POLL_SECONDS:
+                    self.refresh_focus()
+                if message is not None:
+                    state.status = message
+                if errors:
+                    state.status = " · ".join(errors)
+                return
             selected_id = (
                 state.habits[state.selection]["id"]
                 if 0 <= state.selection < len(state.habits) else None
@@ -728,11 +1611,51 @@ class UIApp:
             errors.append(str(error))
         self.last_refresh = state.now = time.monotonic()
         state.date = datetime.now().astimezone()
+        if state.overlay == "focus" and state.now - self.last_focus_refresh >= UI_POLL_SECONDS:
+            self.refresh_focus()
         if errors:
             state.status = " · ".join(dict.fromkeys(([message] if message else []) + errors))
         elif message is not None:
             state.status = message
 
+    def refresh_year(self, *, force=False):
+        state = self.state
+        if force or state.year not in state.years:
+            payload = fetch_year(self.client, state.year)
+            old = grid_habit(state)
+            state.years[state.year] = payload
+            state.grid_selection = next((i for i, h in enumerate(payload["habits"]) if old and h["id"] == old["id"]),
+                                        min(state.grid_selection, max(0, len(payload["habits"]) - 1)))
+
+    def refresh_stats(self, *, force=False):
+        state = self.state
+        if force or state.focus_days not in state.focus_windows:
+            sessions, capped = focus_history(self.client, state.date.date(), state.focus_days * 2)
+            state.focus_windows[state.focus_days] = {"sessions": sessions, "capped": capped}
+            if capped:
+                state.status = "History capped at 20 pages (2000 sessions)"
+
+    def refresh_tasks(self):
+        state = self.state
+        selected = selected_task(state)
+        state.tasks_payload = self.client.call("GET", "kairos/")
+        tasks = visible_tasks(state)
+        state.task_selection = next((i for i, t in enumerate(tasks) if selected and t["id"] == selected["id"]),
+                                    min(state.task_selection, max(0, len(tasks) - 1)))
+
+    def open_tab(self, tab):
+        state = self.state
+        state.tab, state.overlay, state.status = tab, None, ""
+        state.date = datetime.now().astimezone()
+        if tab == 1 and tab not in state.loaded_tabs:
+            self.refresh()
+        elif tab == 2:
+            self.refresh_year()
+        elif tab == 3:
+            self.refresh_stats()
+        elif tab == 4 and tab not in state.loaded_tabs:
+            self.refresh_tasks()
+        state.loaded_tabs.add(tab)
 
 def display_width(text):
     """Terminal cells, including wide emoji/CJK and zero-width combining marks."""
@@ -745,11 +1668,12 @@ def display_width(text):
 
 def clip(text, width):
     """A safe single line, truncated by cells rather than Python character count."""
+    source = text
     text = "".join(" " if unicodedata.category(c) in ("Cc", "Cs") else c for c in str(text))
     if width <= 0:
         return ""
     if display_width(text) <= width:
-        return text
+        return source if text == source else text
     result = ""
     used = 0
     for char in text:
@@ -758,7 +1682,23 @@ def clip(text, width):
             break
         result += char
         used += cells
-    return result + "…"
+    result += "…"
+    if getattr(source, "spans", None):
+        styled = str.__new__(StyledText, result)
+        styled.spans = [(offset, cell_slice(fragment, 0, max(0, display_width(result) - 1 - offset)), style)
+                        for offset, fragment, style in source.spans if offset < display_width(result) - 1]
+        return styled
+    return result
+
+
+def cell_slice(text, start, end):
+    result, offset = "", 0
+    for char in text:
+        size = display_width(char)
+        if (size == 0 and result and start < offset <= end) or (size and start <= offset < end and offset + size <= end):
+            result += char
+        offset += size
+    return result
 
 
 def columns(left, right, width):
@@ -767,10 +1707,10 @@ def columns(left, right, width):
     return left + " " * max(0, width - display_width(left + right)) + right
 
 
-def progress_bar(value, target, width=8):
+def progress_bar(value, target, width=8, *, ascii=False):
     fraction = min(1, max(0, float(value or 0) / float(target))) if target else 0
     filled = int(fraction * width)
-    return "█" * filled + "░" * (width - filled)
+    return ("#" if ascii else "█") * filled + ("." if ascii else "░") * (width - filled)
 
 
 def ui_elapsed(state):
@@ -797,33 +1737,63 @@ def habit_detail(habit):
     if habit["today"]["frozen"]:
         parts.append("frozen today")
     elif not habit["today"]["scheduled"]:
-        parts.append("not scheduled today")
+        parts.append("not today")
+    elif habit["habit_type"] != "numeric":
+        parts.append("done" if habit["today"]["completed"] else "to do")
     return " · ".join(parts)
 
 
-def habit_rows(state, width, count):
+def habit_layout(habits, width, *, ascii=False):
+    labels = [clip(f"{h['emoji']} {h['name']}".strip(), 10000) for h in habits]
+    details = [habit_detail(h) for h in habits]
+    if ascii:
+        labels = [ascii_line(label) for label in labels]
+        details = [ascii_line(detail) for detail in details]
+    strip_width = 16 if width >= 74 else 0
+    bar_width = 10 if width >= 55 else 0
+    streak_width = 7 if width >= 48 else 0
+    fixed = 4 + strip_width + bar_width + streak_width
+    detail_width = min(max(map(display_width, details), default=5), max(0, width - fixed - 8))
+    name_width = max(1, min(max(map(display_width, labels), default=8), width - detail_width - fixed - 2))
+    if strip_width:
+        name_width = max(name_width, min(20, max(1, width - detail_width - fixed - 2)))
+    return labels, details, name_width, detail_width, strip_width, bar_width, streak_width
+
+
+def habit_rows(state, width, count, *, selected_detail=True, selection_marker=True):
+    if count <= 0:
+        return []
     if not state.habits:
         return [(" No habits yet. Add habits in the app.", "secondary")][:count]
-    labels = [f"{h['emoji']} {h['name']}".strip() for h in state.habits]
-    details = [habit_detail(h) for h in state.habits]
-    # Reserve the detail column, but keep at least eight cells for names.
-    detail_width = min(max(map(display_width, details)), max(0, width - 13))
-    name_width = max(1, min(max(map(display_width, labels)), width - detail_width - 5))
+    labels, details, name_width, detail_width, strip_width, bar_width, streak_width = habit_layout(state.habits, width, ascii=state.ascii)
     selection = min(max(0, state.selection), len(state.habits) - 1)
-    start = max(0, selection - count + 1)
+    show_detail = selected_detail and count >= 2
+    capacity = max(1, count - int(show_detail))
+    start = max(0, selection - capacity + 1)
     lines = []
-    for index in range(start, min(len(state.habits), start + count)):
+    for index in range(start, min(len(state.habits), start + capacity)):
         habit = state.habits[index]
         selected = index == selection
         name = clip(labels[index], name_width)
-        line = ("›" if selected else " ") + habit_mark(habit) + " " + name
-        if details[index]:
-            line += " " * (name_width - display_width(name) + 2)
-            line += clip(details[index], max(0, width - display_width(line)))
-        if habit["habit_type"] == "numeric" and display_width(line) + 10 <= width:
-            line += "  " + progress_bar(habit["today"]["value"], habit["target_value"])
+        mark, mark_style = today_mark(habit, ascii=state.ascii)
+        parts = [((">" if state.ascii else "›") if selected and selection_marker else " ", "accent"),
+                 (mark + " ", mark_style), (name, None), (" " * (name_width - display_width(name) + 2), None)]
+        if strip_width:
+            strip = history_strip(habit, ascii=state.ascii, monochrome=state.monochrome)
+            parts += [(strip, None), (" " * (16 - display_width(strip)), None)]
+        if streak_width:
+            streak = habit.get("streak") or 0
+            parts.append(((f"{streak}d" if streak else "-" if state.ascii else "–").rjust(5) + "  ", "gold" if streak >= 7 else "secondary"))
+        parts.append((clip(details[index], detail_width), mark_style))
+        if bar_width and habit["habit_type"] == "numeric":
+            parts.append((" " * (detail_width - display_width(clip(details[index], detail_width)) + 2) +
+                          progress_bar(habit["today"]["value"], habit["target_value"], ascii=state.ascii), mark_style))
+        line = StyledText(parts)
         style = "selected" if selected else "secondary" if habit["today"]["frozen"] or not habit["today"]["scheduled"] else "normal"
         lines.append((line, style))
+        if selected and show_detail:
+            done, eligible, _ = history_counts(habit)
+            lines.append((f"    {done} of {eligible} days in the last 16 weeks · g opens the grid", "secondary"))
     return lines
 
 
@@ -841,6 +1811,8 @@ def wrap_hints(hints, width, separator="  "):
 
 
 HELP_LINES = [
+    "1 Today · 2 Grid · 3 Focus · 4 Tasks",
+    "Esc  Back to Today (cancel a prompt)",
     "↑/↓ or k/j  Move between habits",
     "Enter/Space  Toggle done or add a step",
     "+/=  Mark done or add a quick step",
@@ -852,10 +1824,292 @@ HELP_LINES = [
     "p  Pause or resume the timer",
     "s  Save the timer",
     "d  Discard: y confirms, N keeps it",
+    "g  Selected habit's 16-week grid",
+    "f  Focus view; Esc/f goes back",
+    "Focus: Space/p pause; n notifications",
     "r  Refresh from the server",
     "?  Show help; any key closes it",
-    "q/Esc/Ctrl-C  Quit; timer keeps running",
+    "q/Ctrl-C  Quit; timer keeps running",
 ]
+
+
+PIXEL_FONT = {
+    "0": ("###", "#.#", "#.#", "#.#", "###"),
+    "1": (".#.", "##.", ".#.", ".#.", "###"),
+    "2": ("###", "..#", "###", "#..", "###"),
+    "3": ("###", "..#", ".##", "..#", "###"),
+    "4": ("#.#", "#.#", "###", "..#", "..#"),
+    "5": ("###", "#..", "###", "..#", "###"),
+    "6": ("###", "#..", "###", "#.#", "###"),
+    "7": ("###", "..#", "..#", "..#", "..#"),
+    "8": ("###", "#.#", "###", "#.#", "###"),
+    "9": ("###", "#.#", "###", "..#", "###"),
+    ":": (".", "#", ".", "#", "."),
+}
+
+
+def big_clock(text, width, height, *, ascii=False):
+    pixels = [".".join(PIXEL_FONT[char][row] for char in text) for row in range(5)]
+    for horizontal, vertical in ((4, 2), (2, 1)):
+        if len(pixels[0]) * horizontal <= width and 5 * vertical <= height:
+            rows = []
+            for row in pixels:
+                line = "".join(("#" if ascii else "█") * horizontal if pixel == "#" else " " * horizontal for pixel in row)
+                rows.extend([line] * vertical)
+            return rows
+    return [text]
+
+
+def focus_totals(state):
+    sessions = state.completed_sessions if state.completed_date == state.date.date() else []
+    sessions = [(s, s["duration_seconds"]) for s in sessions]
+    if state.timer:
+        sessions.append((state.timer, ui_elapsed(state)))
+    tags = {}
+    for session, seconds in sessions:
+        association = session["association"]
+        if association["kind"] == "tag":
+            name = association["name"]
+            tags[name] = tags.get(name, 0) + seconds
+    return sum(seconds for _, seconds in sessions), len(sessions), sorted(tags.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+
+
+def focus_lines(state, width, height):
+    timer = state.timer
+    header = (columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title")
+    hints = wrap_hints(["Space/p pause" if timer and timer["status"] == "running" else "Space/p resume",
+                        "s save", "d discard", f"n notify: {'on' if state.notify else 'off'}",
+                        "Esc/f back", "q quit"], width)
+    bottom = [(state.status, "accent"), ("─" * width, "secondary")] + [(line, "secondary") for line in hints]
+    if not timer:
+        return [header, (" No timer running · press t to start one", "secondary")] + bottom
+    elapsed = ui_elapsed(state)
+    running = timer["status"] == "running"
+    label = ("* RUNNING" if state.ascii else "● RUNNING") if running else ("|| PAUSED" if state.ascii else "❚❚ PAUSED")
+    association = timer["association"]
+    if association["kind"] != "none":
+        label += " · " + association["name"]
+    if timer["name"]:
+        label += " · " + timer["name"]
+    target = timer.get("target_duration_seconds")
+    total, count, tags = focus_totals(state)
+    stats = [(f" Today {clock(total)} focused · {count} session{'' if count == 1 else 's'}", "title")]
+    for name, seconds in tags:
+        bar = progress_bar(seconds, max(total, 1), min(24, max(0, width - 30)), ascii=state.ascii)
+        stats.append((columns("   " + clip(name, 18) + "  " + bar, clock(seconds), width), "secondary"))
+    timing = []
+    if target:
+        percent = min(100, int(elapsed / target * 100))
+        timing = [(progress_bar(elapsed, target, min(56, max(0, width - 8)), ascii=state.ascii) + f"  {percent}%", "gold" if elapsed >= target else "accent"),
+                  (f"{clock(target - elapsed)} left of {clock(target)}" + (" · Time's up · press s to save" if elapsed >= target else ""), "secondary")]
+    available = max(1, height - 5 - len(timing) - len(stats) - len(bottom))
+    clock_rows = big_clock(clock(elapsed), width, available, ascii=state.ascii)
+    centered = lambda line: " " * max(0, (width - display_width(line)) // 2) + line
+    lines = [header, ("─" * width, "secondary"), (centered(clip(label, width)), "accent")]
+    lines += [("", "normal")] + [(centered(line), "gold" if target and elapsed >= target else "accent") for line in clock_rows]
+    lines += [(centered(line), style) for line, style in timing]
+    lines += [("", "normal")] * max(0, height - len(lines) - len(stats) - len(bottom))
+    lines += stats + bottom
+    if len(lines) > height:
+        # The clock and state retain priority on very small terminals.
+        lines = [header, (clip(label, width), "accent"), (clock(elapsed), "accent")]
+        lines += (stats + bottom)[:max(0, height - len(lines))]
+    return lines
+
+
+def ascii_line(line):
+    table = str.maketrans({"·": ".", "─": "-", "↑": "^", "↓": "v", "⏎": "Enter",
+                           "−": "-", "±": "+/-", "…": "~", "●": "*", "❚": "|",
+                           "○": "o", "✓": "x", "⇥": "Tab", "←": "<", "→": ">",
+                           "▲": "^", "▼": "v", "›": ">"})
+    convert = lambda text: str(text).translate(table).encode("ascii", "replace").decode("ascii")
+    if not getattr(line, "spans", None):
+        return convert(line)
+    parts, cursor = [], 0
+    for offset, fragment, style in line.spans:
+        parts.append((convert(cell_slice(line, cursor, offset)), None))
+        parts.append((convert(fragment), style))
+        cursor = offset + display_width(fragment)
+    parts.append((convert(cell_slice(line, cursor, display_width(line))), None))
+    return StyledText(parts)
+
+
+def tab_header(state, width):
+    parts = [(" Momentum Grids   ", "title")]
+    for number, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1):
+        parts.append((f"{number} {name}  ", "tab_active" if state.tab == number else "secondary"))
+    full = StyledText(parts)
+    if display_width(full) + 13 <= width:
+        return StyledText([(full, None), (" " * (width - display_width(full) - 10) + state.date.strftime("%a %d %b"), "secondary")])
+    return full
+
+
+def tab_top(state, width):
+    if width < 60:
+        parts = [(f"{n} {name} ", "tab_active" if n == state.tab else "secondary")
+                 for n, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1)]
+        return [(columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title"), (StyledText(parts), "normal")]
+    return [(tab_header(state, width), "normal"), ("─" * width, "secondary")]
+
+
+def grid_habit(state):
+    habits = state.years.get(state.year, {}).get("habits", [])
+    return habits[min(state.grid_selection, len(habits) - 1)] if habits else None
+
+
+def grid_status(state):
+    habit = grid_habit(state)
+    if not habit:
+        return "No habits in this year"
+    day = state.grid_cursor
+    code = year_states(habit, state.year, state.date.date()).get(day, " ")
+    label = {"d": "done", "p": "partial", "m": "missed", "f": "frozen", "o": "not scheduled", "-": "open", " ": "future"}[code]
+    action = "Enter sets value" if habit["habit_type"] == "numeric" else "Enter clears" if code == "d" else "Enter marks done"
+    return f"{day.strftime('%a %-d %b')} · {label} · " + ("future dates cannot be edited" if day > state.date.date() else action)
+
+
+def grid_tab_lines(state, width, height, *, footer=None):
+    lines = tab_top(state, width)
+    habit = grid_habit(state)
+    payload = state.years.get(state.year, {})
+    switcher = f" {state.year}  " + (habit["name"] if habit else "No habits")
+    lines += [(switcher, "title"), (" ⇥/shift-⇥ habit · ←→ at an edge", "secondary")]
+    if habit:
+        # Render thresholds refer to physical terminal columns, before the
+        # reserved final column is removed.
+        lines += year_lines(habit, payload, state.date.date(), cursor=state.grid_cursor,
+                            width=width + 1, height=height, ascii=state.ascii, monochrome=state.monochrome)
+    if footer is None:
+        footer = [(state.status or grid_status(state), "accent"),
+                  ("arrows day · Enter edit", "secondary"),
+                  ("[ previous year · " + ("] next year · " if payload.get("can_go_to_next_year") else "") + "r refresh · Esc back · q quit", "secondary")]
+        if height < 20:
+            footer = footer[:1] + [("Tab · arrows · Enter · [ ] · r · Esc/q", "secondary")]
+    return lines[:max(0, height - len(footer))] + [("", "normal")] * max(0, height - len(lines) - len(footer)) + footer
+
+
+def focus_tab_lines(state, width, height):
+    history = state.focus_windows.get(state.focus_days, {})
+    sessions = history.get("sessions", [])
+    summary = focus_summary(sessions, state.date.date(), state.focus_days, timer=state.timer, elapsed=ui_elapsed(state))
+    delta = summary["delta_seconds"]
+    heading = f" LAST {state.focus_days} DAYS {short_duration(summary['total_seconds'])} focused"
+    comparison = f" {'▲' if delta >= 0 else '▼'} {short_duration(abs(delta))} vs the {state.focus_days} days before"
+    lines = tab_top(state, width) + [(heading + (comparison if width >= 75 else ""), "title")]
+    if width < 75:
+        lines.append((comparison, "secondary"))
+    chart_rows = 8 if height >= 28 else 2
+    lines += focus_chart(summary, width, rows=chart_rows, ascii=state.ascii)
+    lines.append((" BY TAG", "title"))
+    max_tags = max(1, height - len(lines) - 8) if height >= 28 else 1
+    for tag in summary["tags"][:max_tags]:
+        right = f"{short_duration(tag['seconds'])} {tag['percent']}%"
+        name_width = min(20, max(4, width - len(right) - 5))
+        parts = [(" " + clip(tag["name"], name_width).ljust(name_width), "normal")]
+        bar_width = min(30, max(0, width - name_width - len(right) - 5))
+        parts += [(" " + progress_bar(tag["seconds"], max(1, summary["total_seconds"]), bar_width, ascii=state.ascii), "secondary"),
+                  (" " + right, "normal")]
+        lines.append((StyledText(parts), "normal"))
+    if not summary["tags"]:
+        lines.append((" No completed focus yet", "secondary"))
+    lines.append((" RECENT", "title"))
+    recent = ([state.timer] if state.timer else []) + sessions
+    for session in recent[:4 if height >= 28 else 1]:
+        started = parse_time(session["started_at"]).astimezone()
+        live = session is state.timer
+        seconds = ui_elapsed(state) if live else session["duration_seconds"]
+        status = session["status"] if live else "saved"
+        label = started.strftime("%a %d  %H:%M")
+        right = f"{status} {clock(seconds)}"
+        title_width = max(0, width - display_width(label + right) - 5)
+        text = f" {label}  {clip(timer_title(session), title_width)}"
+        lines.append((columns(text, right, width), "accent" if live else "secondary"))
+    hints = "w week · m month · y year · x CSV · f focus · r refresh · Esc back · q quit" if width >= 75 else "w/m/y range · x CSV · f · r · Esc/q"
+    footer = [(state.status or ("History capped at 20 pages (2000 sessions)" if history.get("capped") else ""), "warning" if history.get("capped") else "accent"),
+              (hints, "secondary")]
+    return lines[:max(0, height - len(footer))] + [("", "normal")] * max(0, height - len(lines) - len(footer)) + footer
+
+
+def visible_tasks(state):
+    return [t for tasks in task_sections(state.tasks_payload).values() for t in tasks] if state.tasks_payload else []
+
+
+def selected_task(state):
+    tasks = visible_tasks(state)
+    return tasks[min(state.task_selection, len(tasks) - 1)] if tasks else None
+
+
+def tasks_tab_lines(state, width, height, *, footer=None):
+    payload = state.tasks_payload or {"day": state.date.date().isoformat(), "tasks": [], "groups": [], "limits": {}}
+    groups = {g["id"]: g for g in payload["groups"]}
+    sections = task_sections(payload)
+    today = sections["TODAY"]
+    top = tab_top(state, width) + [(f" KAIROS  {sum(t['state'] == 'open' for t in today)} open today · {sum(t['state'] == 'done' for t in today)} done", "title")]
+    limits = payload.get("limits", {})
+    limit_text = []
+    if limits.get("group_limit") is not None:
+        limit_text.append(f"groups {len(groups)}/{limits['group_limit']}")
+    if limits.get("step_reminders") is False:
+        limit_text.append("reminders require an upgrade")
+    if limit_text:
+        top.append((" " + " · ".join(limit_text), "secondary"))
+    selected = selected_task(state)
+    rows, selected_row = [], 0
+    for section, tasks in sections.items():
+        rows.append((" " + section, "title"))
+        if not tasks:
+            rows.append(("   No tasks", "secondary"))
+        for task in tasks:
+            is_selected = selected and task["id"] == selected["id"]
+            done = task["state"] == "done"
+            mark = ("x" if done else "o") if state.ascii else ("✓" if done else "○")
+            group = groups.get(task.get("group_id"))
+            reminder = parse_time(task.get("remind_at"))
+            detail = (" ● " + group["name"]) if group else ""
+            detail += (" " + reminder.astimezone().strftime("%H:%M")) if reminder else ""
+            title_width = max(4, width - display_width(detail) - 5)
+            if display_width(detail) > width // 2:
+                detail = clip(detail, width // 2)
+                title_width = max(4, width - display_width(detail) - 5)
+            title = clip(task["title"], title_width)
+            parts = [(('›' if is_selected else ' ') + f" {mark} {title}", "secondary" if done else "normal")]
+            parts.append((" " * max(1, width - display_width(parts[0][0]) - display_width(detail)) + detail,
+                          "group_" + group["color"] if group else "secondary"))
+            if is_selected:
+                selected_row = len(rows)
+            rows.append((StyledText(parts), "selected" if is_selected else "normal"))
+            if is_selected:
+                if task.get("first_step"):
+                    rows += [("     first step  " + task["first_step"], "secondary")]
+                if reminder:
+                    rows += [("     reminder    " + reminder.astimezone().strftime("%a %d %b at %H:%M"), "secondary")]
+    if footer is None:
+        footer = [(state.status, "accent"), ("Space done/undo · → tomorrow · l later · T today", "secondary"),
+                  ("a add · e edit · r remind · x dismiss · t timer", "secondary"), ("R refresh · Esc back · q quit", "secondary")]
+        if height < 20:
+            footer = footer[:1] + [("Space · a e r x t · → l T · R · Esc/q", "secondary")]
+    count = max(0, height - len(top) - len(footer))
+    start = max(0, selected_row - count + 3)
+    shown = rows[start:start + count]
+    return top + shown + [("", "normal")] * max(0, count - len(shown)) + footer
+
+
+def input_lines(state, width):
+    labels = {"year_value": "Value", "task_add": "New task ›", "task_edit": "Title ›",
+              "task_remind": "Reminder HH:MM ›", "focus_export": "CSV file ›"}
+    if state.overlay == "year_confirm":
+        habit, day = state.pending_edit
+        prompt = f"Change {habit['name']} on {day.isoformat()} (older than 7 days)? y/N"
+    elif state.overlay == "task_dismiss":
+        prompt = f"Dismiss {state.pending_task['title']}? y/N"
+    else:
+        prompt = labels[state.overlay] + " " + state.input_text + "_"
+    lines = tab_top(state, width) + [(line, "accent") for line in wrap_hints(prompt.split(), width, " ")]
+    if state.overlay in ("task_add", "task_remind"):
+        destinations = ("Today", "Tomorrow", "Later") if state.overlay == "task_add" else ("Today", "Tomorrow")
+        lines += [(" " + destinations[state.input_destination] + " · ⇥ switch", "title")]
+    lines += [(state.status, "warning"), ("y confirms · Esc cancels" if state.overlay in ("year_confirm", "task_dismiss") else "Backspace · Enter saves · Esc cancels", "secondary")]
+    return lines
 
 
 def render(state, width, height):
@@ -867,7 +2121,19 @@ def render(state, width, height):
     width, height = max(0, width - 1), max(0, height)
     if not width or not height:
         return []
-    if state.overlay == "help":
+    if state.overlay in ("year_value", "task_add", "task_edit", "task_remind"):
+        # Inline prompts keep the relevant grid/task selection on screen.
+        footer = [("─" * width, "secondary")] + input_lines(state, width)[len(tab_top(state, width)):]
+        lines = (grid_tab_lines(state, width, height, footer=footer) if state.overlay == "year_value"
+                 else tasks_tab_lines(state, width, height, footer=footer))
+    elif state.overlay in ("year_confirm", "task_dismiss", "focus_export"):
+        lines = input_lines(state, width)
+    elif state.overlay == "focus":
+        lines = focus_lines(state, width, height)
+    elif state.overlay == "grid":
+        lines = grid_lines(state.habits[state.selection], state.date, ascii=state.ascii, monochrome=state.monochrome) if state.habits else []
+        lines += [("", "normal"), (" Any key closes the grid", "secondary")]
+    elif state.overlay == "help":
         lines = [(" Momentum Grids · Help", "title"), ("", "normal")]
         lines += [(line, "normal") for line in HELP_LINES]
         lines += [("", "normal"), (" Any key closes help", "secondary")]
@@ -889,15 +2155,19 @@ def render(state, width, height):
                   if state.overlay == "minutes" else state.discard_prompt)
         # Wrapping keeps the complete destructive confirmation readable at 40 columns.
         lines = [(" Start a timer" if state.overlay == "minutes" else " Discard timer", "title")]
-        lines += [(line, "accent") for line in wrap_hints(prompt.split(), width, " ")]
+        lines += [(line, "accent" if state.overlay == "minutes" else "warning") for line in wrap_hints(prompt.split(), width, " ")]
         lines += [(state.status, "accent"),
                   ("Digits · Backspace · Enter · Esc cancel" if state.overlay == "minutes"
                    else "y discard  N/Esc keep", "secondary")]
+    elif state.tab == 2:
+        lines = grid_tab_lines(state, width, height)
+    elif state.tab == 3:
+        lines = focus_tab_lines(state, width, height)
+    elif state.tab == 4:
+        lines = tasks_tab_lines(state, width, height)
     else:
         timer = state.timer
-        top = [(columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title")]
-        if height >= 12:
-            top.append(("─" * width, "secondary"))
+        top = tab_top(state, width)
         if timer:
             elapsed = ui_elapsed(state)
             label = "● " if timer["status"] == "running" else "❚❚ Paused · "
@@ -909,31 +2179,248 @@ def render(state, width, height):
                 else:
                     left = f"{clock(target - elapsed)} left"
                     bar_width = min(20, max(0, width - display_width(left) - 5))
-                    top.append(("   " + progress_bar(elapsed, target, bar_width) + "  " + left, "secondary"))
+                    top.append(("   " + progress_bar(elapsed, target, bar_width, ascii=state.ascii) + "  " + left, "secondary"))
         else:
             top.append((" No timer running · press t to start one", "secondary"))
         if height >= 12:
             top.append(("", "normal"))
-        eligible = [h for h in state.habits if h["today"]["completed"] or
-                    (h["today"]["scheduled"] and not h["today"]["frozen"])]
-        done = sum(bool(h["today"]["completed"]) for h in eligible)
-        top.append((f" Today  {done} of {len(eligible)} done", "title"))
+        done, total = today_counts(state.habits)
+        dots = ("#" * done + "o" * (total - done)) if state.ascii else ("●" * done + "○" * (total - done))
+        summary = f" TODAY  {done} of {total} done  " + clip(dots, max(0, width - 55 if width >= 79 else width - 24))
+        if width >= 79:
+            spark, rate = sparkline(state.habits, ascii=state.ascii)
+            summary = columns(summary, f"LAST 9 DAYS {spark} {rate}%", width)
+        top.append((summary, "title"))
+        if height >= 12:
+            _, _, name_width, _, strip_width, _, streak_width = habit_layout(state.habits, width, ascii=state.ascii)
+            heading = "   " + clip("HABIT", name_width).ljust(name_width + 2)
+            heading += "LAST 14 DAYS    " if strip_width else ""
+            heading += "STREAK " if streak_width else ""
+            top.append((heading + "TODAY", "secondary"))
         hints = ["↑↓ move", "⏎ log", "+ − adjust", "t timer"]
         if timer:
             hints += ["p pause" if timer["status"] == "running" else "p resume", "s save", "d discard"]
-        hints += ["r refresh", "? help", "q quit"]
+        hints += ["g grid", "f focus", "r refresh", "? help", "q quit"]
         foot = wrap_hints(hints, width) if height >= 10 else [
             "↑↓ ⏎ ± t " + ("p s d " if timer else "") + "r ? q"
         ]
-        bottom = ([("─" * width, "secondary")] if height >= 12 else [])
-        bottom += [(state.status, "accent")] + [(line, "secondary") for line in foot]
+        bottom = [(state.status, "accent")]
+        bottom += ([("─" * width, "secondary")] if height >= 12 else [])
+        bottom += [(line, "secondary") for line in foot]
+        if height >= 20:
+            legend = "    " + "  ".join(day_glyph(code, ascii=state.ascii, monochrome=state.monochrome) + " " + label
+                                        for code, label in zip("dpmfo-", ("done", "partial", "missed", "frozen", "off", "today open")))
+            bottom.insert(0, (legend, "secondary"))
         # In unusually short terminals, always retain a row for the selection.
         bottom = bottom[-max(0, height - 1):] if height > 1 else []
         top = top[:max(0, height - len(bottom) - 1)]
         count = max(0, height - len(top) - len(bottom))
         rows = habit_rows(state, width, count)
         lines = top + rows + [("", "normal")] * max(0, count - len(rows)) + bottom
-    return [(clip(text, width), style) for text, style in lines[:height]]
+    return [(ascii_line(clip(ascii_line(text), width)) if state.ascii else clip(text, width), style)
+            for text, style in lines[:height]]
+
+
+def begin_grid_value(app):
+    state = app.state
+    habit, day = state.pending_edit
+    if habit["habit_type"] == "numeric":
+        entry = next((e for e in habit["entries"] if e["date"] == day.isoformat()), {})
+        state.input_text = number(entry.get("value") or "0")
+        state.overlay = "year_value"
+        state.status = ""
+    else:
+        save_grid_value(app)
+
+
+def save_grid_value(app, value=None):
+    state = app.state
+    habit, day = state.pending_edit
+    # No local mutation on a refused write and no retry of the request.
+    set_history_day(app.client, habit, day, value=value)
+    state.overlay = None
+    state.loaded_tabs.discard(1)
+    state.years = {state.year: state.years[state.year]}
+    state.status = f"Saved {habit['name']} · {day.isoformat()}"
+    app.refresh_year(force=True)
+
+
+def handle_tab_input(app, key):
+    state = app.state
+    overlay = state.overlay
+    inputs = ("year_value", "year_confirm", "task_add", "task_edit", "task_remind", "task_dismiss", "focus_export")
+    if overlay not in inputs:
+        return False
+    if key == "ESC":
+        state.overlay = None
+        state.status = "Cancelled"
+        return True
+    if overlay == "year_confirm":
+        state.overlay = None
+        if key in ("y", "Y"):
+            begin_grid_value(app)
+        else:
+            state.status = "Kept the day unchanged"
+        return True
+    if overlay == "task_dismiss":
+        state.overlay = None
+        if key in ("y", "Y"):
+            change_task(app.client, state.pending_task, "dismiss")
+            app.refresh_tasks()
+            state.status = "Dismissed " + state.pending_task["title"]
+        else:
+            state.status = "Kept the task"
+        return True
+    if key in ("TAB", "\t") and overlay in ("task_add", "task_remind"):
+        state.input_destination = (state.input_destination + 1) % (3 if overlay == "task_add" else 2)
+    elif key == "BACKSPACE":
+        state.input_text = state.input_text[:-1]
+    elif key == "ENTER":
+        if overlay == "year_value":
+            try:
+                value = Decimal(state.input_text)
+            except InvalidOperation as error:
+                raise CLIError("Enter a non-negative number.") from error
+            if not value.is_finite() or value < 0:
+                raise CLIError("Enter a non-negative number.")
+            save_grid_value(app, value)
+        elif overlay == "task_add":
+            add_task(app.client, state.input_text, ("today", "tomorrow", "later")[state.input_destination], identity=state.capture_id)
+            state.overlay = None
+            app.refresh_tasks()
+            state.status = "Added " + state.input_text
+        elif overlay == "task_edit":
+            change_task(app.client, state.pending_task, "edit", title=state.input_text)
+            state.overlay = None
+            app.refresh_tasks()
+            state.status = "Updated task title"
+        elif overlay == "task_remind":
+            try:
+                reminder_time = datetime.strptime(state.input_text, "%H:%M").time()
+            except ValueError as error:
+                raise CLIError("Use HH:MM; Tab chooses today or tomorrow.") from error
+            base = date.fromisoformat(state.tasks_payload["day"]) + timedelta(days=state.input_destination)
+            # astimezone() resolves the local offset for the selected date,
+            # including a DST boundary between today and tomorrow.
+            reminder = datetime.combine(base, reminder_time).astimezone()
+            change_task(app.client, state.pending_task, "remind", remind_at=reminder.isoformat())
+            state.overlay = None
+            app.refresh_tasks()
+            state.status = "Reminder saved"
+        else:
+            if not state.input_text.strip():
+                raise CLIError("Enter a filename, or Esc to cancel.")
+            sessions, capped = focus_history(app.client, state.date.date(), state.focus_days)
+            export_focus(sessions, state.input_text)
+            state.overlay = None
+            state.status = "Exported " + state.input_text + (" · capped at 20 pages" if capped else "")
+    elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+        allowed = "0123456789." if overlay == "year_value" else "0123456789:" if overlay == "task_remind" else None
+        if allowed is None or key in allowed:
+            limit = 200 if overlay in ("task_add", "task_edit") else 1024 if overlay == "focus_export" else 20
+            state.input_text = (state.input_text + key)[:limit]
+    return True
+
+
+def handle_tab_key(app, key):
+    state = app.state
+    if state.tab == 2:
+        payload = state.years.get(state.year, {})
+        habit = grid_habit(state)
+        if key == "r":
+            app.refresh_year(force=True)
+            state.status = "Refreshed"
+        elif key in ("[", "]"):
+            if key == "]" and not payload.get("can_go_to_next_year"):
+                state.status = "Already at the latest year"
+                return True
+            new_year = state.year + (1 if key == "]" else -1)
+            if new_year < 1900:
+                state.status = "The earliest supported year is 1900"
+                return True
+            state.year = new_year
+            try:
+                state.grid_cursor = state.grid_cursor.replace(year=new_year)
+            except ValueError:  # Feb 29 in a non-leap year
+                state.grid_cursor = date(new_year, 2, 28)
+            app.refresh_year()
+            state.status = ""
+        elif key in ("TAB", "\t", "BTAB"):
+            habits = payload.get("habits", [])
+            if habits:
+                state.grid_selection = (state.grid_selection + (-1 if key == "BTAB" else 1)) % len(habits)
+                state.status = ""
+        elif key in ("UP", "DOWN", "LEFT", "RIGHT") and habit:
+            delta = {"UP": -1, "DOWN": 1, "LEFT": -7, "RIGHT": 7}[key]
+            candidate = state.grid_cursor + timedelta(days=delta)
+            if candidate.year == state.year:
+                state.grid_cursor = candidate
+            elif key in ("LEFT", "RIGHT"):
+                state.grid_selection = (state.grid_selection + (1 if key == "RIGHT" else -1)) % len(payload["habits"])
+            state.status = ""
+        elif key == "ENTER" and habit:
+            if state.grid_cursor > state.date.date():
+                state.status = "Future dates cannot be edited."
+            elif habit.get("can_log") is False:
+                state.status = (habit.get("logging_block") or {}).get("message", "This habit cannot be logged.")
+            else:
+                state.pending_edit = (habit, state.grid_cursor)
+                if (state.date.date() - state.grid_cursor).days > 7:
+                    state.overlay = "year_confirm"
+                else:
+                    begin_grid_value(app)
+        return True
+    if state.tab == 3:
+        if key in ("w", "m", "y"):
+            state.focus_days = {"w": 7, "m": 30, "y": 365}[key]
+            state.status = ""
+            app.refresh_stats()
+        elif key == "r":
+            state.status = ""
+            app.refresh_stats(force=True)
+        elif key == "x":
+            state.overlay, state.input_text = "focus_export", ""
+        elif key == "f":
+            if state.timer:
+                state.overlay = "focus"
+                app.refresh_focus()
+            else:
+                state.status = "No timer running · press t to start one"
+        elif key in ("t", "p", "s", "d"):
+            return False
+        return True
+    if state.tab == 4:
+        task = selected_task(state)
+        if key in ("UP", "DOWN", "j", "k"):
+            state.task_selection = min(max(0, state.task_selection + (1 if key in ("DOWN", "j") else -1)), max(0, len(visible_tasks(state)) - 1))
+        elif key == "R" or (key == "r" and task is None):
+            app.refresh_tasks()
+            state.status = "Refreshed"
+        elif key == "a":
+            state.overlay, state.input_text, state.input_destination = "task_add", "", 0
+            state.capture_id = str(uuid.uuid4())
+            state.status = ""
+        elif task:
+            if key in (" ", "RIGHT", "l", "T"):
+                action = ("undo" if task["state"] == "done" else "done") if key == " " else {"RIGHT": "tomorrow", "l": "later", "T": "today"}[key]
+                change_task(app.client, task, action)
+                app.refresh_tasks()
+                state.status = f"{task['title']} · {action}"
+            elif key in ("e", "r", "x"):
+                state.pending_task = dict(task)
+                state.overlay = {"e": "task_edit", "r": "task_remind", "x": "task_dismiss"}[key]
+                state.input_text = task["title"] if key == "e" else ""
+                state.input_destination = 0
+                state.status = ""
+            elif key == "t":
+                if state.timer:
+                    state.status = "Save (s) or discard (d) the current timer first"
+                else:
+                    session = start_timer(app.client, name=task["title"])
+                    state.timer, state.timer_fetched_at = session, time.monotonic()
+                    state.status = "Started " + task["title"]
+        return True
+    return False
 
 
 def handle_key(app, key):
@@ -945,20 +2432,51 @@ def handle_key(app, key):
         return
     if key in ("RESIZE", -1):
         return
-    if state.overlay == "help":
+    editing = state.overlay in ("task_add", "task_edit", "focus_export", "tags")
+    if key == "q" and not editing:
+        app.quit = True
+        return
+    if state.overlay in ("help", "grid") and key not in ("1", "2", "3", "4"):
         state.overlay = None
         return
     try:
+        if handle_tab_input(app, key):
+            return
+        if state.overlay in (None, "focus", "help", "grid") and key in ("1", "2", "3", "4"):
+            app.open_tab(int(key))
+            return
+        if state.overlay is None:
+            if key == "ESC" and state.tab != 1:
+                app.open_tab(1)
+                return
+            if state.tab != 1 and handle_tab_key(app, key):
+                return
         if state.overlay == "discard":
             session = state.pending_discard
-            state.overlay = None
+            state.overlay = state.discard_return
+            state.discard_return = None
             if key in ("y", "Y"):
                 change_timer(app.client, session, "discard")
                 state.timer = None
+                state.overlay = None
                 app.refresh(f"Discarded {timer_title(session)}")
             else:
                 state.status = "Kept the timer"
             return
+        if state.overlay == "focus":
+            if key in ("ESC", "f"):
+                state.overlay = None
+                return
+            if key == "q":
+                app.quit = True
+                return
+            if key == "n":
+                state.notify = not state.notify
+                return
+            if key == " ":
+                key = "p"
+            if key not in ("p", "s", "d"):
+                return
         if state.overlay == "tags":
             choices = tag_choices(state)
             if key == "ESC":
@@ -989,10 +2507,18 @@ def handle_key(app, key):
             elif isinstance(key, str) and key in "0123456789" and len(key) == 1:
                 state.minutes = (state.minutes + key)[:6]
             return
-        if key in ("q", "ESC"):
-            app.quit = True
+        if key == "ESC":
+            state.overlay = None
         elif key == "?":
             state.overlay = "help"
+        elif key == "g" and state.habits:
+            state.overlay = "grid"
+        elif key == "f":
+            if state.timer:
+                state.overlay = "focus"
+                app.refresh_focus()
+            else:
+                state.status = "No timer running · press t to start one"
         elif key in ("UP", "k", "DOWN", "j"):
             delta = 1 if key in ("DOWN", "j") else -1
             state.selection = min(max(0, state.selection + delta), max(0, len(state.habits) - 1))
@@ -1012,6 +2538,7 @@ def handle_key(app, key):
                 return
             session = state.timer
             if key == "d":
+                state.discard_return = state.overlay
                 state.pending_discard = session
                 state.discard_prompt = f"Discard {timer_title(session)} ({clock(ui_elapsed(state))}) without saving? y/N"
                 state.overlay = "discard"
@@ -1019,6 +2546,11 @@ def handle_key(app, key):
             action = "finish" if key == "s" else "pause" if session["status"] == "running" else "resume"
             updated = change_timer(app.client, session, action)
             state.timer = None if action == "finish" else updated
+            if action == "finish":
+                state.overlay = None
+                state.focus_windows.clear()
+                if state.tab == 3:
+                    app.refresh_stats()
             state.timer_fetched_at = time.monotonic()
             verb = {"finish": "Saved", "pause": "Paused", "resume": "Resumed"}[action]
             app.refresh(f"{verb} {timer_title(session)}")
@@ -1033,8 +2565,18 @@ def handle_key(app, key):
                 set_today(app.client, habit, value=numeric_value(habit, raw))
                 message = f"Logged {habit['name']}: {habit_detail(habit)}"
             app.refresh(message)
+            state.years.clear()
     except CLIError as error:
-        app.refresh(str(error))
+        if state.tab == 1 and state.overlay not in ("year_value", "year_confirm", "task_add", "task_edit", "task_remind", "task_dismiss", "focus_export"):
+            app.refresh(str(error))
+        else:
+            state.status = str(error)
+            if isinstance(error, APIError) and error.status == 409 and state.tab == 4:
+                state.overlay = None
+                try:
+                    app.refresh_tasks()
+                except CLIError as refresh_error:
+                    state.status += " · " + str(refresh_error)
 
 
 def curses_ui(screen, app):
@@ -1046,19 +2588,38 @@ def curses_ui(screen, app):
     screen.keypad(True)
     screen.timeout(1000)
     styles = {"normal": 0, "title": curses.A_BOLD, "accent": curses.A_BOLD,
-              "secondary": curses.A_DIM, "selected": curses.A_REVERSE | curses.A_BOLD}
+              "secondary": curses.A_DIM, "selected": curses.A_REVERSE | curses.A_BOLD,
+              "gold": curses.A_BOLD, "partial": 0, "missed": curses.A_DIM,
+              "frozen": 0, "warning": curses.A_BOLD,
+              "tab_active": curses.A_BOLD | curses.A_UNDERLINE | curses.A_REVERSE,
+              "cursor": curses.A_REVERSE | curses.A_BOLD}
+    styles.update({"group_" + name: 0 for name in GROUP_INDEXES})
     # wrapper() initializes colors. Keep pair zero on the terminal's background
     # even when NO_COLOR disables all accent pairs.
     with contextlib.suppress(curses.error):
         curses.use_default_colors()
-    if "NO_COLOR" not in os.environ and curses.has_colors():
+    colors = app.color != "never" and "NO_COLOR" not in os.environ and curses.has_colors()
+    app.state.monochrome = not colors
+    if colors:
         with contextlib.suppress(curses.error):
-            curses.init_pair(1, 214 if curses.COLORS >= 256 else curses.COLOR_YELLOW, -1)
-            curses.init_pair(2, 137 if curses.COLORS >= 256 else curses.COLOR_YELLOW, -1)
+            palette = PALETTES[theme_name()]
+            for pair, style in enumerate(("accent", "secondary", "gold", "partial", "missed", "frozen", "warning", "normal"), 1):
+                basic = curses.COLOR_CYAN if style == "frozen" else curses.COLOR_RED if style == "warning" else curses.COLOR_YELLOW
+                curses.init_pair(pair, palette[style][1] if curses.COLORS >= 256 else basic, -1)
+                styles[style] |= curses.color_pair(pair)
             for style in ("title", "accent", "selected"):
                 styles[style] |= curses.color_pair(1)
-            styles["secondary"] |= curses.color_pair(2)
+            styles["tab_active"] = curses.A_BOLD | curses.A_UNDERLINE | curses.color_pair(1)
+            styles["cursor"] |= curses.color_pair(1)
+            indexes = GROUP_LIGHT_INDEXES if theme_name() == "light" else GROUP_INDEXES
+            basics = (curses.COLOR_BLUE, curses.COLOR_MAGENTA, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
+                      curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_BLUE, curses.COLOR_RED,
+                      curses.COLOR_GREEN, curses.COLOR_CYAN)
+            for pair, ((name, index), basic) in enumerate(zip(indexes.items(), basics), 9):
+                curses.init_pair(pair, index if curses.COLORS >= 256 else basic, -1)
+                styles["group_" + name] = curses.color_pair(pair)
     keys = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_ENTER: "ENTER",
+            curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT", curses.KEY_BTAB: "BTAB",
             curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_RESIZE: "RESIZE"}
     app.refresh()
     while not app.quit:
@@ -1066,11 +2627,17 @@ def curses_ui(screen, app):
         app.state.date = datetime.now().astimezone()
         if app.state.now - app.last_refresh >= UI_POLL_SECONDS:
             app.refresh()
+        if app.check_done():
+            with contextlib.suppress(curses.error):
+                curses.beep()
         height, width = screen.getmaxyx()
         screen.erase()
         for row, (line, style) in enumerate(render(app.state, width, height)):
             with contextlib.suppress(curses.error):
                 screen.addstr(row, 0, line, styles[style])
+                for column, fragment, span_style in getattr(line, "spans", []):
+                    if fragment:
+                        screen.addstr(row, column, fragment, styles[span_style] | (curses.A_REVERSE if style == "selected" else 0))
         screen.refresh()
         try:
             key = screen.get_wch()
@@ -1091,11 +2658,57 @@ def cmd_ui(client, args, out):
     out.flush()
     os.environ.setdefault("ESCDELAY", "25")  # Esc closes overlays without curses' 1 s wait
     try:
-        curses.wrapper(curses_ui, UIApp(client))
+        curses.wrapper(curses_ui, UIApp(client, color=args.color))
     except KeyboardInterrupt:
         pass
     except curses.error as error:
         raise CLIError(f"Could not open the interactive view: {error}") from error
+
+
+def cmd_completion(client, args, out):
+    parser = build_parser()
+    commands = next(action.choices for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    global_options = [option for action in parser._actions for option in action.option_strings]
+    options = {name: sorted({option for action in command._actions for option in action.option_strings})
+               for name, command in commands.items()}
+    task_commands = next(action.choices for action in commands["task"]._actions if isinstance(action, argparse._SubParsersAction))
+    options["task"] = sorted(set(options["task"] + list(task_commands) +
+                                 [option for command in task_commands.values() for action in command._actions for option in action.option_strings]))
+    names = " ".join(commands)
+    if args.shell == "bash":
+        lines = ["_momentum() {", '  local cur="${COMP_WORDS[COMP_CWORD]}" cmd="" word choices',
+                 '  for word in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do',
+                 f'    case " {names} " in *" $word "*) cmd="$word"; break;; esac', '  done',
+                 '  case "${COMP_WORDS[COMP_CWORD-1]}" in',
+                 '    --color) COMPREPLY=( $(compgen -W "auto always never" -- "$cur") ); return;;',
+                 '    completion) COMPREPLY=( $(compgen -W "zsh bash fish" -- "$cur") ); return;;',
+                 '  esac', '  case "$cmd" in']
+        lines += [f'    {name}) choices="{" ".join(flags)}";;' for name, flags in options.items()]
+        lines += [f'    *) choices="{names} {" ".join(global_options)}";;', '  esac',
+                  '  COMPREPLY=( $(compgen -W "$choices" -- "$cur") )', '}', 'complete -F _momentum momentum']
+    elif args.shell == "zsh":
+        lines = ['#compdef momentum', '_momentum() {', '  local command="" word',
+                 '  for word in ${words[2,-1]}; do', f'    case " {names} " in *" $word "*) command="$word"; break;; esac',
+                 '  done', '  if [[ ${words[CURRENT-1]} == --color ]]; then',
+                 "    _values 'color' auto always never; return", '  fi',
+                 '  if [[ $command == completion && ${words[CURRENT]} != -* ]]; then',
+                 "    _values 'shell' zsh bash fish; return", '  fi', '  case $command in']
+        lines += [f"    {name}) _values 'option' {' '.join(chr(39) + flag + chr(39) for flag in flags)};;" for name, flags in options.items()]
+        lines += [f"    *) _values 'command' {names} {' '.join(chr(39) + flag + chr(39) for flag in global_options)};;", '  esac', '}', 'compdef _momentum momentum']
+    else:
+        lines = ['complete -c momentum -f', f"complete -c momentum -n '__fish_use_subcommand' -a '{names}'"]
+        for name, flags in options.items():
+            for flag in flags:
+                if not flag.startswith("-"):
+                    lines.append(f"complete -c momentum -n '__fish_seen_subcommand_from {name}' -a '{flag}'")
+                    continue
+                flag_option = ("-l " + flag[2:]) if flag.startswith("--") else ("-s " + flag[1:])
+                values = " -x -a 'auto always never'" if flag == "--color" else ""
+                lines.append(f"complete -c momentum -n '__fish_seen_subcommand_from {name}' {flag_option}{values}")
+        lines += ["complete -c momentum -l color -x -a 'auto always never'",
+                  "complete -c momentum -l version",
+                  "complete -c momentum -n '__fish_seen_subcommand_from completion' -a 'zsh bash fish'"]
+    print("\n".join(lines), file=out)
 
 
 def build_parser():
@@ -1106,6 +2719,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"momentum {VERSION}")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="terminal colour (default: auto)")
     parser.set_defaults(handler=cmd_ui)
     commands = parser.add_subparsers(dest="command", metavar="command")
 
@@ -1159,6 +2773,49 @@ def build_parser():
     undo = commands.add_parser("undo", help="clear today's log for a habit")
     undo.add_argument("habit", help="habit name (a unique prefix or part) or id")
     undo.set_defaults(handler=cmd_undo)
+
+    today = commands.add_parser("today", help="today's habits, history and completion summary")
+    today.set_defaults(handler=cmd_today)
+    grid = commands.add_parser("grid", help="show a habit's last 16 weeks")
+    grid.add_argument("habit", help="habit name (a unique prefix or part) or id")
+    grid.set_defaults(handler=cmd_grid)
+    year = commands.add_parser("year", help="show a habit's year grid and stats")
+    year.add_argument("habit", help="habit name or id")
+    year.add_argument("--year", type=int, help="calendar year (default: current)")
+    year.set_defaults(handler=cmd_year)
+    week = commands.add_parser("week", help="last seven days of focus, bars and tags")
+    week.set_defaults(handler=cmd_week)
+    export = commands.add_parser("export", help="export completed focus sessions as CSV")
+    export.add_argument("--days", type=positive_days, default=7)
+    export.add_argument("--output", help="create a private CSV file (default: stdout)")
+    export.set_defaults(handler=cmd_export)
+    tasks = commands.add_parser("tasks", help="list Kairos tasks by planned day")
+    tasks.set_defaults(handler=cmd_tasks)
+    task = commands.add_parser("task", help="add or complete a Kairos task")
+    task_commands = task.add_subparsers(dest="task_command", required=True)
+    add = task_commands.add_parser("add", help="capture and plan a task")
+    add.add_argument("title")
+    destination = add.add_mutually_exclusive_group()
+    destination.add_argument("--tomorrow", action="store_true")
+    destination.add_argument("--later", action="store_true")
+    add.set_defaults(handler=cmd_task)
+    done = task_commands.add_parser("done", help="complete a task by title")
+    done.add_argument("query")
+    done.set_defaults(handler=cmd_task)
+    prompt = commands.add_parser("prompt", help="cached one-line status for shells and tmux")
+    prompt.add_argument("--max-age", type=float, default=60, help="refresh cache after this many seconds (default: 60)")
+    prompt.add_argument("--format", help="template: {timer}, {elapsed}, {done}, {total}")
+    prompt.add_argument("--tmux", action="store_true", help="emit tmux styles instead of ANSI")
+    prompt.set_defaults(handler=cmd_prompt)
+    completion = commands.add_parser("completion", help="print a shell completion script")
+    completion.add_argument("shell", choices=("zsh", "bash", "fish"))
+    completion.set_defaults(handler=cmd_completion)
+    for command in commands.choices.values():
+        command.add_argument("--color", choices=("auto", "always", "never"), default=argparse.SUPPRESS)
+    for command in task_commands.choices.values():
+        command.add_argument("--color", choices=("auto", "always", "never"), default=argparse.SUPPRESS)
+    for command in (status, tags, habits, today, grid, prompt, year, week, tasks):
+        command.add_argument("--json", action="store_true", help="print stable JSON without presentation styles")
     return parser
 
 
@@ -1168,14 +2825,25 @@ def main(argv=None, *, transport=urllib_transport, config_dir=None, out=None):
     if args.command is None and (not sys.stdin.isatty() or not out.isatty()):
         print(GET_STARTED, file=out)
         return 0
-    client = Client(SessionStore(config_dir or default_config_dir()), transport=transport)
     try:
+        if args.command == "completion":
+            args.handler(None, args, out)
+            return 0
+        client = Client(SessionStore(config_dir or default_config_dir()), transport=transport)
         args.handler(client, args, out)
     except CLIError as error:
+        if args.command == "prompt":
+            return 0
         print(f"momentum: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        if args.command == "prompt":
+            return 0
         return 130
+    except Exception:
+        if args.command == "prompt":
+            return 0
+        raise
     return 0
 
 
