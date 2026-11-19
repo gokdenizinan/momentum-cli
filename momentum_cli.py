@@ -39,7 +39,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://momentumgrids.com"
 API_PREFIX = "/api/v1/mobile/"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 CLIENT_VERSION = f"cli-{VERSION}"
 # Refresh early so a request never races the 15-minute access-token expiry.
 REFRESH_MARGIN = timedelta(seconds=60)
@@ -1038,7 +1038,9 @@ def half_year_lines(states, year, half, *, cursor=None, ascii=False, monochrome=
             day = monday + timedelta(days=week * 7 + weekday)
             code = states.get(day, " ") if first <= day <= last else " "
             glyph = day_glyph(code, ascii=ascii, monochrome=monochrome)
-            parts.append((glyph + (" " if week < weeks - 1 else ""), "cursor" if day == cursor else DAY_STYLES.get(code)))
+            parts.append((glyph, "cursor" if day == cursor else DAY_STYLES.get(code)))
+            if week < weeks - 1:
+                parts.append((" ", None))
         rows.append((StyledText(parts), "normal"))
     return rows
 
@@ -1776,8 +1778,12 @@ def habit_rows(state, width, count, *, selected_detail=True, selection_marker=Tr
         selected = index == selection
         name = clip(labels[index], name_width)
         mark, mark_style = today_mark(habit, ascii=state.ascii)
-        parts = [((">" if state.ascii else "›") if selected and selection_marker else " ", "accent"),
-                 (mark + " ", mark_style), (name, None), (" " * (name_width - display_width(name) + 2), None)]
+        label = ((">" if state.ascii else "›") if selected and selection_marker else " ") + mark + " " + name
+        if selected and selection_marker:
+            parts = [(label, "selected")]
+        else:
+            parts = [(label[:1], "accent"), (mark + " ", mark_style), (name, None)]
+        parts.append((" " * (name_width - display_width(name) + 2), None))
         if strip_width:
             strip = history_strip(habit, ascii=state.ascii, monochrome=state.monochrome)
             parts += [(strip, None), (" " * (16 - display_width(strip)), None)]
@@ -1789,7 +1795,7 @@ def habit_rows(state, width, count, *, selected_detail=True, selection_marker=Tr
             parts.append((" " * (detail_width - display_width(clip(details[index], detail_width)) + 2) +
                           progress_bar(habit["today"]["value"], habit["target_value"], ascii=state.ascii), mark_style))
         line = StyledText(parts)
-        style = "selected" if selected else "secondary" if habit["today"]["frozen"] or not habit["today"]["scheduled"] else "normal"
+        style = "secondary" if habit["today"]["frozen"] or not habit["today"]["scheduled"] else "normal"
         lines.append((line, style))
         if selected and show_detail:
             done, eligible, _ = history_counts(habit)
@@ -1937,7 +1943,7 @@ def ascii_line(line):
 def tab_header(state, width):
     parts = [(" Momentum Grids   ", "title")]
     for number, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1):
-        parts.append((f"{number} {name}  ", "tab_active" if state.tab == number else "secondary"))
+        parts += [(f"{number} {name}", "tab_active" if state.tab == number else "secondary"), ("  ", None)]
     full = StyledText(parts)
     if display_width(full) + 13 <= width:
         return StyledText([(full, None), (" " * (width - display_width(full) - 10) + state.date.strftime("%a %d %b"), "secondary")])
@@ -1946,8 +1952,9 @@ def tab_header(state, width):
 
 def tab_top(state, width):
     if width < 60:
-        parts = [(f"{n} {name} ", "tab_active" if n == state.tab else "secondary")
-                 for n, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1)]
+        parts = []
+        for n, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1):
+            parts += [(f"{n} {name}", "tab_active" if n == state.tab else "secondary"), (" ", None)]
         return [(columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title"), (StyledText(parts), "normal")]
     return [(tab_header(state, width), "normal"), ("─" * width, "secondary")]
 
@@ -2005,7 +2012,8 @@ def focus_tab_lines(state, width, height):
     for tag in summary["tags"][:max_tags]:
         right = f"{short_duration(tag['seconds'])} {tag['percent']}%"
         name_width = min(20, max(4, width - len(right) - 5))
-        parts = [(" " + clip(tag["name"], name_width).ljust(name_width), "normal")]
+        name = clip(ascii_line(tag["name"]) if state.ascii else tag["name"], name_width)
+        parts = [(" " + name + " " * (name_width - display_width(name)), "normal")]
         bar_width = min(30, max(0, width - name_width - len(right) - 5))
         parts += [(" " + progress_bar(tag["seconds"], max(1, summary["total_seconds"]), bar_width, ascii=state.ascii), "secondary"),
                   (" " + right, "normal")]
@@ -2067,17 +2075,21 @@ def tasks_tab_lines(state, width, height, *, footer=None):
             reminder = parse_time(task.get("remind_at"))
             detail = (" ● " + group["name"]) if group else ""
             detail += (" " + reminder.astimezone().strftime("%H:%M")) if reminder else ""
+            if state.ascii:
+                detail = ascii_line(detail)
             title_width = max(4, width - display_width(detail) - 5)
             if display_width(detail) > width // 2:
                 detail = clip(detail, width // 2)
                 title_width = max(4, width - display_width(detail) - 5)
-            title = clip(task["title"], title_width)
-            parts = [(('›' if is_selected else ' ') + f" {mark} {title}", "secondary" if done else "normal")]
-            parts.append((" " * max(1, width - display_width(parts[0][0]) - display_width(detail)) + detail,
+            title = clip(ascii_line(task["title"]) if state.ascii else task["title"], title_width)
+            parts = [(('›' if is_selected else ' ') + f" {mark} {title}",
+                      "selected" if is_selected else "secondary" if done else "normal")]
+            parts.append((" " * max(1, width - display_width(parts[0][0]) - display_width(detail)), None))
+            parts.append((detail,
                           "group_" + group["color"] if group else "secondary"))
             if is_selected:
                 selected_row = len(rows)
-            rows.append((StyledText(parts), "selected" if is_selected else "normal"))
+            rows.append((StyledText(parts), "normal"))
             if is_selected:
                 if task.get("first_step"):
                     rows += [("     first step  " + task["first_step"], "secondary")]
@@ -2144,8 +2156,8 @@ def render(state, width, height):
         choices = tag_choices(state)
         count = max(0, height - len(top) - len(bottom))
         start = max(0, state.picker_selection - count + 1)
-        rows = [(("› " if i == state.picker_selection else "  ") + (tag["name"] if tag else "No tag"),
-                 "selected" if i == state.picker_selection else "normal")
+        rows = [(StyledText([(("› " if i == state.picker_selection else "  ") + (tag["name"] if tag else "No tag"),
+                             "selected" if i == state.picker_selection else None)]), "normal")
                 for i, tag in enumerate(choices) if start <= i < start + count]
         if not choices:
             rows = [(" No matching tags", "secondary")][:count]
@@ -2424,8 +2436,14 @@ def handle_tab_key(app, key):
 
 
 def handle_key(app, key):
-    """Handle terminal-independent keys; all API errors become visible status text."""
+    """Translate terminal keys and handle input; API errors become status text."""
     state = app.state
+    if isinstance(key, int):
+        import curses
+
+        key = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_ENTER: "ENTER",
+               curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT", curses.KEY_BTAB: "BTAB",
+               curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_RESIZE: "RESIZE"}.get(key, key)
     key = {"\n": "ENTER", "\r": "ENTER", "\x1b": "ESC", "\x7f": "BACKSPACE", "\b": "BACKSPACE"}.get(key, key)
     if key == "\x03":
         app.quit = True
@@ -2580,7 +2598,7 @@ def handle_key(app, key):
 
 
 def curses_ui(screen, app):
-    """The thin terminal adapter: styles, safe drawing, and key translation."""
+    """The thin terminal adapter: styles, safe drawing, and input."""
     import curses
 
     with contextlib.suppress(curses.error):
@@ -2618,9 +2636,6 @@ def curses_ui(screen, app):
             for pair, ((name, index), basic) in enumerate(zip(indexes.items(), basics), 9):
                 curses.init_pair(pair, index if curses.COLORS >= 256 else basic, -1)
                 styles["group_" + name] = curses.color_pair(pair)
-    keys = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_ENTER: "ENTER",
-            curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT", curses.KEY_BTAB: "BTAB",
-            curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_RESIZE: "RESIZE"}
     app.refresh()
     while not app.quit:
         app.state.now = time.monotonic()
@@ -2637,13 +2652,49 @@ def curses_ui(screen, app):
                 screen.addstr(row, 0, line, styles[style])
                 for column, fragment, span_style in getattr(line, "spans", []):
                     if fragment:
-                        screen.addstr(row, column, fragment, styles[span_style] | (curses.A_REVERSE if style == "selected" else 0))
+                        screen.addstr(row, column, fragment, styles[span_style])
         screen.refresh()
         try:
             key = screen.get_wch()
         except curses.error:  # timeout: redraw the local timer
             continue
-        handle_key(app, keys.get(key, key))
+        handle_key(app, key)
+
+
+def curses_term_override(term, has_rep, ncurses_version, fallback_available):
+    """Old ncurses repeats only a wide glyph's low byte when terminfo has rep."""
+    if (term and term != "xterm-256color" and has_rep and fallback_available
+            and (ncurses_version is None or tuple(ncurses_version[:2]) < (6, 1))):
+        return "xterm-256color"
+    return None
+
+
+def prepare_curses_terminal(fd=-1):
+    """Choose a safe process-local TERM before wrapper/initscr reads it."""
+    import curses
+
+    term = os.environ.get("TERM")
+    version = getattr(curses, "ncurses_version", None)
+    if os.environ.get("MOMENTUM_KEEP_TERM") == "1" or not curses_term_override(term, True, version, True):
+        return
+    try:
+        curses.setupterm(term, fd)
+        has_rep = bool(curses.tigetstr("rep"))
+        if not has_rep:
+            return
+        # Python caches its first setupterm(), so inspect the fallback in a
+        # fresh interpreter. initscr() will re-read our final TERM in this one.
+        probe = subprocess.run(
+            [sys.executable, "-c", "import curses, sys; curses.setupterm('xterm-256color'); "
+             "sys.exit(bool(curses.tigetstr('rep')))"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        override = curses_term_override(term, has_rep, version, probe.returncode == 0)
+        if override:
+            os.environ["TERM"] = override
+    except (curses.error, OSError, subprocess.SubprocessError):
+        pass  # Compatibility detection must never prevent opening the UI.
 
 
 def cmd_ui(client, args, out):
@@ -2657,6 +2708,7 @@ def cmd_ui(client, args, out):
 
     out.flush()
     os.environ.setdefault("ESCDELAY", "25")  # Esc closes overlays without curses' 1 s wait
+    prepare_curses_terminal()
     try:
         curses.wrapper(curses_ui, UIApp(client, color=args.color))
     except KeyboardInterrupt:

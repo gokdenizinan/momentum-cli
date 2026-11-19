@@ -139,6 +139,11 @@ Colours follow your terminal's light or dark background automatically. Set
 `MOMENTUM_THEME=light` or `dark` to choose, `NO_COLOR=1` or `--color never`
 for none, and `MOMENTUM_ASCII=1` if your font lacks the symbols.
 
+In Ghostty and other terminals whose terminfo can repeat characters, macOS's
+older ncurses garbles repeated symbols, so the interactive view runs as
+`xterm-256color` there (only for itself). `MOMENTUM_KEEP_TERM=1` keeps your
+`TERM` unchanged.
+
 ## Privacy and security
 
 - Signing in creates a separate session for this computer. It appears in
