@@ -39,7 +39,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://momentumgrids.com"
 API_PREFIX = "/api/v1/mobile/"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 CLIENT_VERSION = f"cli-{VERSION}"
 # Refresh early so a request never races the 15-minute access-token expiry.
 REFRESH_MARGIN = timedelta(seconds=60)
@@ -739,11 +739,13 @@ PALETTES = {
     "dark": {"normal": ("EFE6DA", 223), "secondary": ("A08C78", 137),
              "accent": ("F0913A", 214), "gold": ("E9B949", 179),
              "partial": ("B8692A", 130), "missed": ("7A6552", 95),
-             "frozen": ("9CC0D3", 152), "warning": ("E3826A", 173)},
+             "frozen": ("9CC0D3", 152), "warning": ("E3826A", 173),
+             "rest": ("6FC7B4", 79), "key_bg": ("3A2C20", 237)},
     "light": {"normal": ("2A1D12", 235), "secondary": ("6F5A47", 58),
               "accent": ("A84E0C", 130), "gold": ("7F5700", 94),
               "partial": ("E39D52", 179), "missed": ("9C8874", 138),
-              "frozen": ("2C6A8A", 24), "warning": ("A63E26", 124)},
+              "frozen": ("2C6A8A", 24), "warning": ("A63E26", 124),
+              "rest": ("17705F", 29), "key_bg": ("D7D7AF", 188)},
 }
 DAY_STYLES = {"d": "gold", "p": "partial", "m": "missed", "f": "frozen",
               "o": "secondary", "-": "accent"}
@@ -1476,7 +1478,7 @@ def cmd_prompt(client, args, out):
             print_prompt(cache, args, out)
 
 
-def notify_done(session, *, enabled=None):
+def notify_desktop(text, *, enabled=None):
     enabled = os.environ.get("MOMENTUM_NOTIFY") != "0" if enabled is None else enabled
     if not enabled or sys.platform != "darwin":
         return
@@ -1484,9 +1486,13 @@ def notify_done(session, *, enabled=None):
     command = ["osascript"]
     for line in script:
         command += ["-e", line]
-    text = f"Time's up · {timer_title(session)} · {clock(session['target_duration_seconds'])}"
     with contextlib.suppress(Exception):
         subprocess.run([*command, text], capture_output=True, timeout=2, check=False)
+
+
+def notify_done(session, *, enabled=None):
+    text = f"Time's up · {timer_title(session)} · {clock(session['target_duration_seconds'])}"
+    notify_desktop(text, enabled=enabled)
 
 
 def completed_today(client, today):
@@ -1530,6 +1536,7 @@ class UIState:
     monochrome: bool = field(default_factory=lambda: "NO_COLOR" in os.environ)
     completed_sessions: list = field(default_factory=list)
     completed_date: object = None
+    focus_break: dict | None = None
     notify: bool = field(default_factory=lambda: os.environ.get("MOMENTUM_NOTIFY") != "0")
     tab: int = 1
     loaded_tabs: set = field(default_factory=lambda: {1})
@@ -1576,7 +1583,45 @@ class UIApp:
             self.notified.add(timer["id"])
             notify_done(timer, enabled=state.notify)
             return True
+        rest = state.focus_break
+        if rest and not rest["notified"] and break_elapsed(state) >= rest["seconds"]:
+            rest["notified"] = True
+            if state.notify:
+                notify_desktop(f"Break over · round {rest['next_round']} of 4 is next", enabled=True)
+                return True
         return False
+
+    def begin_focus_break(self, saved):
+        state = self.state
+        saved_round = focus_round(state)
+        started = time.monotonic()
+        state.timer = None
+        state.timer_fetched_at = started
+        state.focus_break = {
+            "started": started, "seconds": break_minutes(saved_round) * 60,
+            "saved_round": saved_round, "next_round": saved_round % 4 + 1,
+            "association": {key: saved["association"][key] for key in ("kind", "id", "name")},
+            "name": saved["name"], "target_seconds": saved.get("target_duration_seconds"),
+            "notified": False,
+        }
+        if state.completed_date == state.date.date():
+            state.completed_sessions.append(saved)
+        for window in state.focus_windows.values():
+            window["sessions"].insert(0, saved)
+        state.status = f"Saved {timer_title(saved)}"
+
+    def start_focus_round(self):
+        state = self.state
+        rest = state.focus_break
+        association = rest["association"]
+        target = rest["target_seconds"]
+        session = start_timer(self.client,
+                              tag=association if association["kind"] == "tag" else None,
+                              habit=association if association["kind"] == "habit" else None,
+                              name=rest["name"] or None, minutes=target / 60 if target else None)
+        state.timer, state.timer_fetched_at = session, time.monotonic()
+        state.focus_break = None
+        state.status = f"Started round {rest['next_round']} · {timer_title(session)}"
 
     def refresh(self, message=None):
         """Keep the last good data on failure and throttle even failed polls."""
@@ -1585,6 +1630,8 @@ class UIApp:
         try:
             state.timer = active_timer(self.client)
             state.timer_fetched_at = time.monotonic()
+            if state.timer:
+                state.focus_break = None
         except CLIError as error:
             errors.append(str(error))
         try:
@@ -1831,8 +1878,10 @@ HELP_LINES = [
     "s  Save the timer",
     "d  Discard: y confirms, N keeps it",
     "g  Selected habit's 16-week grid",
-    "f  Focus view; Esc/f goes back",
-    "Focus: Space/p pause; n notifications",
+    "f  Focus clock or break · Esc/f back",
+    "Focus Space/p  Pause or resume · s saves and starts a break",
+    "Break Space/p  Start next round · d ends the break",
+    "n  Toggle notifications in focus mode",
     "r  Refresh from the server",
     "?  Show help; any key closes it",
     "q/Ctrl-C  Quit; timer keeps running",
@@ -1856,7 +1905,7 @@ PIXEL_FONT = {
 
 def big_clock(text, width, height, *, ascii=False):
     pixels = [".".join(PIXEL_FONT[char][row] for char in text) for row in range(5)]
-    for horizontal, vertical in ((4, 2), (2, 1)):
+    for horizontal, vertical in ((8, 4), (6, 3), (4, 2), (2, 1)):
         if len(pixels[0]) * horizontal <= width and 5 * vertical <= height:
             rows = []
             for row in pixels:
@@ -1864,6 +1913,20 @@ def big_clock(text, width, height, *, ascii=False):
                 rows.extend([line] * vertical)
             return rows
     return [text]
+
+
+def focus_round(state):
+    rounds_done = len(state.completed_sessions) if state.completed_date == state.date.date() else 0
+    return rounds_done % 4 + 1
+
+
+def break_minutes(round_number):
+    return 15 if round_number == 4 else 5
+
+
+def break_elapsed(state):
+    rest = state.focus_break
+    return min(rest["seconds"], max(0, int(state.now - rest["started"])))
 
 
 def focus_totals(state):
@@ -1880,53 +1943,164 @@ def focus_totals(state):
     return sum(seconds for _, seconds in sessions), len(sessions), sorted(tags.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
 
 
-def focus_lines(state, width, height):
-    timer = state.timer
-    header = (columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title")
-    hints = wrap_hints(["Space/p pause" if timer and timer["status"] == "running" else "Space/p resume",
-                        "s save", "d discard", f"n notify: {'on' if state.notify else 'off'}",
-                        "Esc/f back", "q quit"], width)
-    bottom = [(state.status, "accent"), ("─" * width, "secondary")] + [(line, "secondary") for line in hints]
-    if not timer:
-        return [header, (" No timer running · press t to start one", "secondary")] + bottom
-    elapsed = ui_elapsed(state)
-    running = timer["status"] == "running"
-    label = ("* RUNNING" if state.ascii else "● RUNNING") if running else ("|| PAUSED" if state.ascii else "❚❚ PAUSED")
-    association = timer["association"]
-    if association["kind"] != "none":
-        label += " · " + association["name"]
-    if timer["name"]:
-        label += " · " + timer["name"]
-    target = timer.get("target_duration_seconds")
+def focus_today_lines(state, width, current_tag):
     total, count, tags = focus_totals(state)
-    stats = [(f" Today {clock(total)} focused · {count} session{'' if count == 1 else 's'}", "title")]
-    for name, seconds in tags:
-        bar = progress_bar(seconds, max(total, 1), min(24, max(0, width - 30)), ascii=state.ascii)
-        stats.append((columns("   " + clip(name, 18) + "  " + bar, clock(seconds), width), "secondary"))
+    stats = [(StyledText([(" TODAY  ", "secondary_bold"), (short_duration(total), "normal_bold"),
+                         (f" focused · {count} session{'' if count == 1 else 's'}", "secondary")]), "normal")]
+    if not tags:
+        return stats
+    longest = max(1, tags[0][1])
+    duration_width = max(5, max(len(short_duration(seconds)) for _, seconds in tags))
+    name_width = min(12, max(0, width - duration_width - 7))
+    bar_width = min(30, max(0, width - name_width - duration_width - 7))
+    for tag, seconds in sorted(tags, key=lambda item: item[0] != current_tag):
+        name = clip(ascii_line(tag) if state.ascii else tag, name_width)
+        bar = ("#" if state.ascii else "█") * round(seconds / longest * bar_width)
+        duration = short_duration(seconds).rjust(duration_width)
+        parts = [("   " + name + " " * (name_width - display_width(name) + 2), "normal"),
+                 (bar, "accent" if tag == current_tag else "partial"),
+                 (" " * (bar_width - len(bar) + 2) + duration, "normal")]
+        stats.append((StyledText(parts), "normal"))
+    return stats
+
+
+def focus_footer(state, width):
+    space = "Space" if state.ascii else "␣"
+    notify = f"notify: {'on' if state.notify else 'off'}"
+    quit_label = "quit"
+    if state.focus_break:
+        hints = [(space, f"start round {state.focus_break['next_round']}"), ("d", "end break"), ("n", notify)]
+    elif state.timer:
+        action = "pause" if state.timer["status"] == "running" else "resume"
+        hints = [(space, action), ("s", "save"), ("d", "discard"), ("n", notify)]
+        if width >= len(" q  quit, timer keeps running"):
+            quit_label = "quit, timer keeps running"
+    else:
+        hints = [("n", notify)]
+    hints += [("esc", "back"), ("q", quit_label)]
+    rows, parts, used = [], [], 0
+    for key, label in hints:
+        keycap, label = f" {key} ", f" {label}"
+        pair_width = display_width(keycap + label)
+        if pair_width > width:
+            continue
+        if used and used + pair_width + 2 > width:
+            rows.append((StyledText(parts), "normal"))
+            parts, used = [], 0
+        if used:
+            parts.append(("  ", None))
+            used += 2
+        parts += [(keycap, "key"), (label, "secondary")]
+        used += pair_width
+    if parts:
+        rows.append((StyledText(parts), "normal"))
+    return rows
+
+
+def focus_lines(state, width, height):
+    header = tab_top(state, width, active_tab=3)
+    rule = ("─" * width, "secondary")
+    footer = focus_footer(state, width)
+    timer, rest = state.timer, state.focus_break
+
+    def centered(line, style):
+        line = clip(ascii_line(line) if state.ascii else line, width)
+        pad = " " * ((width - display_width(line)) // 2)
+        return (StyledText([(pad, None), (line, None)]) if getattr(line, "spans", None) else pad + line, style)
+
+    message = [centered(state.status, "accent")] if state.status else []
+    if not timer and not rest:
+        return (header + [(" No timer running · press t to start one", "secondary")] + message + [rule] + footer)[:height]
+
+    if rest:
+        elapsed, target = break_elapsed(state), rest["seconds"]
+        tone = "rest"
+        badge = "● BREAK OVER" if elapsed >= target else "● BREAK"
+        association, name = rest["association"], rest["name"]
+        round_label = f"BREAK · next: round {rest['next_round']} of 4"
+        round_note, done_rounds, current_round = "", rest["saved_round"], None
+    else:
+        elapsed, target = ui_elapsed(state), timer.get("target_duration_seconds")
+        association, name = timer["association"], timer["name"]
+        if target and elapsed >= target:
+            badge, tone = "● TIME'S UP", "gold"
+        elif timer["status"] == "paused":
+            badge, tone = "❚❚ PAUSED", "accent"
+        else:
+            badge, tone = "● RUNNING", "accent"
+        current_round = focus_round(state)
+        round_label = f"ROUND {current_round} OF 4"
+        round_note = f"then a {break_minutes(current_round)}-minute break"
+        done_rounds = current_round - 1
+
+    status_labels = [(badge, tone)]
+    if association["name"]:
+        status_labels.append((("next: " if rest else "") + association["name"], "normal_bold"))
+    if name:
+        status_labels.append((("next: " if rest and not association["name"] else "") + name, "normal"))
+    status_width = sum(display_width(ascii_line(text) if state.ascii else text) for text, _ in status_labels)
+    separator = "  ·  " if status_width + 5 * (len(status_labels) - 1) <= width else " · "
+    status_parts = [status_labels[0]]
+    for part in status_labels[1:]:
+        status_parts += [(separator, "secondary"), part]
+    status = centered(StyledText(status_parts), "normal")
+
+    gap = "   " if width >= 60 else " "
+    round_parts = [(round_label, "secondary_bold"), (gap, None)]
+    for number in range(1, 5):
+        if number > 1 and width >= 60:
+            round_parts.append((" ", None))
+        if number <= done_rounds:
+            round_parts.append(("●", "gold"))
+        elif number == current_round:
+            round_parts.append(("◉", "accent"))
+        else:
+            round_parts.append(("○", "secondary"))
+    rounds = StyledText(round_parts)
+    round_rows = []
+    if round_note and display_width(rounds + gap + round_note) <= width:
+        rounds = StyledText([(rounds, None), (gap + round_note, "secondary")])
+    elif round_note:
+        round_rows.append(centered(round_note, "secondary"))
+    round_rows.insert(0, centered(rounds, "normal"))
+
     timing = []
     if target:
         percent = min(100, int(elapsed / target * 100))
-        timing = [(progress_bar(elapsed, target, min(56, max(0, width - 8)), ascii=state.ascii) + f"  {percent}%", "gold" if elapsed >= target else "accent"),
-                  (f"{clock(target - elapsed)} left of {clock(target)}" + (" · Time's up · press s to save" if elapsed >= target else ""), "secondary")]
-    available = max(1, height - 5 - len(timing) - len(stats) - len(bottom))
-    clock_rows = big_clock(clock(elapsed), width, available, ascii=state.ascii)
-    centered = lambda line: " " * max(0, (width - display_width(line)) // 2) + line
-    lines = [header, ("─" * width, "secondary"), (centered(clip(label, width)), "accent")]
-    lines += [("", "normal")] + [(centered(line), "gold" if target and elapsed >= target else "accent") for line in clock_rows]
-    lines += [(centered(line), style) for line, style in timing]
-    lines += [("", "normal")] * max(0, height - len(lines) - len(stats) - len(bottom))
-    lines += stats + bottom
-    if len(lines) > height:
-        # The clock and state retain priority on very small terminals.
-        lines = [header, (clip(label, width), "accent"), (clock(elapsed), "accent")]
-        lines += (stats + bottom)[:max(0, height - len(lines))]
-    return lines
+        bar = progress_bar(elapsed, target, min(56, max(0, width - 8)), ascii=state.ascii)
+        remaining = f"{clock(target - elapsed)} left of {clock(target)}"
+        if elapsed >= target:
+            remaining = f"Press space to start round {rest['next_round']}" if rest else "Time's up · press s to save"
+        timing = [centered(StyledText([(bar, tone), (f"  {percent}%", "normal_bold")]), "normal"),
+                  centered(remaining, tone if elapsed >= target else "secondary")]
+
+    current_tag = association["name"] if association["kind"] == "tag" and not rest else None
+    stats = focus_today_lines(state, width, current_tag)
+    details = timing + round_rows + message
+    available = height - len(header) - 1 - len(details) - len(stats) - len(footer) - 2
+    if available < 1:
+        # Retain the clock, status and whole key pairs on short terminals.
+        compact_header = header[:1] if height < len(header) + 2 else header
+        primary = compact_header + [status, centered(clock(elapsed), tone)] + details
+        remaining_rows = max(0, height - len(primary))
+        footer = footer[:remaining_rows]
+        return (primary + stats[:remaining_rows - len(footer)] + footer)[:height]
+
+    clock_rows = [centered(line, tone) for line in big_clock(clock(elapsed), width, available, ascii=state.ascii)]
+    blank = ("", "normal")
+    spacing = [blank] if height >= 24 and available - len(clock_rows) >= 6 else []
+    lines = header + spacing * 2 + [status] + spacing + clock_rows
+    if timing:
+        lines += spacing + timing
+    lines += spacing + round_rows + message
+    bottom = [rule] + stats + spacing + [rule] + footer
+    return lines + [blank] * (height - len(lines) - len(bottom)) + bottom
 
 
 def ascii_line(line):
     table = str.maketrans({"·": ".", "─": "-", "↑": "^", "↓": "v", "⏎": "Enter",
                            "−": "-", "±": "+/-", "…": "~", "●": "*", "❚": "|",
-                           "○": "o", "✓": "x", "⇥": "Tab", "←": "<", "→": ">",
+                           "○": "o", "◉": "@", "✓": "x", "⇥": "Tab", "←": "<", "→": ">",
                            "▲": "^", "▼": "v", "›": ">"})
     convert = lambda text: str(text).translate(table).encode("ascii", "replace").decode("ascii")
     if not getattr(line, "spans", None):
@@ -1940,23 +2114,24 @@ def ascii_line(line):
     return StyledText(parts)
 
 
-def tab_header(state, width):
+def tab_header(state, width, active_tab):
     parts = [(" Momentum Grids   ", "title")]
     for number, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1):
-        parts += [(f"{number} {name}", "tab_active" if state.tab == number else "secondary"), ("  ", None)]
+        parts += [(f"{number} {name}", "tab_active" if active_tab == number else "secondary"), ("  ", None)]
     full = StyledText(parts)
     if display_width(full) + 13 <= width:
         return StyledText([(full, None), (" " * (width - display_width(full) - 10) + state.date.strftime("%a %d %b"), "secondary")])
     return full
 
 
-def tab_top(state, width):
+def tab_top(state, width, *, active_tab=None):
+    active_tab = state.tab if active_tab is None else active_tab
     if width < 60:
         parts = []
         for n, name in enumerate(("Today", "Grid", "Focus", "Tasks"), 1):
-            parts += [(f"{n} {name}", "tab_active" if n == state.tab else "secondary"), (" ", None)]
+            parts += [(f"{n} {name}", "tab_active" if n == active_tab else "secondary"), (" ", None)]
         return [(columns(" Momentum Grids", state.date.strftime("%a %d %b"), width), "title"), (StyledText(parts), "normal")]
-    return [(tab_header(state, width), "normal"), ("─" * width, "secondary")]
+    return [(tab_header(state, width, active_tab), "normal"), ("─" * width, "secondary")]
 
 
 def grid_habit(state):
@@ -2392,12 +2567,6 @@ def handle_tab_key(app, key):
             app.refresh_stats(force=True)
         elif key == "x":
             state.overlay, state.input_text = "focus_export", ""
-        elif key == "f":
-            if state.timer:
-                state.overlay = "focus"
-                app.refresh_focus()
-            else:
-                state.status = "No timer running · press t to start one"
         elif key in ("t", "p", "s", "d"):
             return False
         return True
@@ -2430,6 +2599,7 @@ def handle_tab_key(app, key):
                 else:
                     session = start_timer(app.client, name=task["title"])
                     state.timer, state.timer_fetched_at = session, time.monotonic()
+                    state.focus_break = None
                     state.status = "Started " + task["title"]
         return True
     return False
@@ -2445,13 +2615,11 @@ def handle_key(app, key):
                curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT", curses.KEY_BTAB: "BTAB",
                curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_RESIZE: "RESIZE"}.get(key, key)
     key = {"\n": "ENTER", "\r": "ENTER", "\x1b": "ESC", "\x7f": "BACKSPACE", "\b": "BACKSPACE"}.get(key, key)
-    if key == "\x03":
-        app.quit = True
-        return
     if key in ("RESIZE", -1):
         return
     editing = state.overlay in ("task_add", "task_edit", "focus_export", "tags")
-    if key == "q" and not editing:
+    if key == "\x03" or (key == "q" and not editing):
+        state.focus_break = None
         app.quit = True
         return
     if state.overlay in ("help", "grid") and key not in ("1", "2", "3", "4"):
@@ -2464,6 +2632,13 @@ def handle_key(app, key):
             app.open_tab(int(key))
             return
         if state.overlay is None:
+            if key == "f":
+                if state.timer or state.focus_break:
+                    state.overlay = "focus"
+                    app.refresh_focus()
+                else:
+                    state.status = "No timer running · press t to start one"
+                return
             if key == "ESC" and state.tab != 1:
                 app.open_tab(1)
                 return
@@ -2485,11 +2660,19 @@ def handle_key(app, key):
             if key in ("ESC", "f"):
                 state.overlay = None
                 return
-            if key == "q":
-                app.quit = True
-                return
             if key == "n":
                 state.notify = not state.notify
+                if state.focus_break:
+                    state.status = f"Notifications {'on' if state.notify else 'off'}"
+                return
+            if state.focus_break:
+                if key in (" ", "p"):
+                    app.start_focus_round()
+                elif key == "s":
+                    state.status = "Breaks aren't saved"
+                elif key == "d":
+                    state.focus_break = state.overlay = None
+                    state.status = "Ended the break"
                 return
             if key == " ":
                 key = "p"
@@ -2520,6 +2703,7 @@ def handle_key(app, key):
                 session = start_timer(app.client, tag=state.pending_tag, minutes=int(state.minutes or "0"))
                 state.timer = session
                 state.timer_fetched_at = time.monotonic()
+                state.focus_break = None
                 state.overlay = None
                 app.refresh(f"Started {timer_title(session)}")
             elif isinstance(key, str) and key in "0123456789" and len(key) == 1:
@@ -2531,12 +2715,6 @@ def handle_key(app, key):
             state.overlay = "help"
         elif key == "g" and state.habits:
             state.overlay = "grid"
-        elif key == "f":
-            if state.timer:
-                state.overlay = "focus"
-                app.refresh_focus()
-            else:
-                state.status = "No timer running · press t to start one"
         elif key in ("UP", "k", "DOWN", "j"):
             delta = 1 if key in ("DOWN", "j") else -1
             state.selection = min(max(0, state.selection + delta), max(0, len(state.habits) - 1))
@@ -2563,6 +2741,9 @@ def handle_key(app, key):
                 return
             action = "finish" if key == "s" else "pause" if session["status"] == "running" else "resume"
             updated = change_timer(app.client, session, action)
+            if action == "finish" and state.overlay == "focus":
+                app.begin_focus_break(updated)
+                return
             state.timer = None if action == "finish" else updated
             if action == "finish":
                 state.overlay = None
@@ -2585,7 +2766,9 @@ def handle_key(app, key):
             app.refresh(message)
             state.years.clear()
     except CLIError as error:
-        if state.tab == 1 and state.overlay not in ("year_value", "year_confirm", "task_add", "task_edit", "task_remind", "task_dismiss", "focus_export"):
+        if state.overlay == "focus" and state.focus_break:
+            state.status = str(error)
+        elif state.tab == 1 and state.overlay not in ("year_value", "year_confirm", "task_add", "task_edit", "task_remind", "task_dismiss", "focus_export"):
             app.refresh(str(error))
         else:
             state.status = str(error)
@@ -2609,6 +2792,7 @@ def curses_ui(screen, app):
               "secondary": curses.A_DIM, "selected": curses.A_REVERSE | curses.A_BOLD,
               "gold": curses.A_BOLD, "partial": 0, "missed": curses.A_DIM,
               "frozen": 0, "warning": curses.A_BOLD,
+              "rest": curses.A_BOLD, "key": curses.A_REVERSE,
               "tab_active": curses.A_BOLD | curses.A_UNDERLINE | curses.A_REVERSE,
               "cursor": curses.A_REVERSE | curses.A_BOLD}
     styles.update({"group_" + name: 0 for name in GROUP_INDEXES})
@@ -2620,7 +2804,8 @@ def curses_ui(screen, app):
     app.state.monochrome = not colors
     if colors:
         with contextlib.suppress(curses.error):
-            palette = PALETTES[theme_name()]
+            theme = theme_name()
+            palette = PALETTES[theme]
             for pair, style in enumerate(("accent", "secondary", "gold", "partial", "missed", "frozen", "warning", "normal"), 1):
                 basic = curses.COLOR_CYAN if style == "frozen" else curses.COLOR_RED if style == "warning" else curses.COLOR_YELLOW
                 curses.init_pair(pair, palette[style][1] if curses.COLORS >= 256 else basic, -1)
@@ -2629,13 +2814,25 @@ def curses_ui(screen, app):
                 styles[style] |= curses.color_pair(1)
             styles["tab_active"] = curses.A_BOLD | curses.A_UNDERLINE | curses.color_pair(1)
             styles["cursor"] |= curses.color_pair(1)
-            indexes = GROUP_LIGHT_INDEXES if theme_name() == "light" else GROUP_INDEXES
+            indexes = GROUP_LIGHT_INDEXES if theme == "light" else GROUP_INDEXES
             basics = (curses.COLOR_BLUE, curses.COLOR_MAGENTA, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
                       curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_BLUE, curses.COLOR_RED,
                       curses.COLOR_GREEN, curses.COLOR_CYAN)
             for pair, ((name, index), basic) in enumerate(zip(indexes.items(), basics), 9):
                 curses.init_pair(pair, index if curses.COLORS >= 256 else basic, -1)
                 styles["group_" + name] = curses.color_pair(pair)
+            curses.init_pair(19, palette["rest"][1] if curses.COLORS >= 256 else curses.COLOR_CYAN, -1)
+            styles["rest"] |= curses.color_pair(19)
+            if curses.COLORS >= 256:
+                foreground, background = palette["normal"][1], palette["key_bg"][1]
+            elif theme == "light":
+                foreground, background = curses.COLOR_BLACK, curses.COLOR_WHITE
+            else:
+                foreground, background = curses.COLOR_WHITE, curses.COLOR_BLACK
+            curses.init_pair(20, foreground, background)
+            styles["key"] = curses.color_pair(20)
+    styles["normal_bold"] = styles["normal"] | curses.A_BOLD
+    styles["secondary_bold"] = styles["secondary"] | curses.A_BOLD
     app.refresh()
     while not app.quit:
         app.state.now = time.monotonic()

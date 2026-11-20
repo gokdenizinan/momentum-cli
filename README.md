@@ -70,7 +70,7 @@ Keys on Today:
 | Enter or Space | Mark done / undo, or add one step to a number habit |
 | + and − | Add or subtract a step |
 | g | The selected habit's last 16 weeks |
-| f | Focus mode: a big clock for the running timer |
+| f | Focus mode: a big clock for the running timer, in rounds of four. Saving there (s) starts a 5-minute break, 15 after round 4; Space starts the next round |
 | t | Start a timer: type to find a tag, Enter, then minutes for a countdown (or Enter for none) |
 | p / s / d | Pause or resume, save, discard (asks first) |
 | r | Refresh |
