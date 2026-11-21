@@ -24,9 +24,9 @@ momentum login
 ```
 
 You'll see a short code like `BCDF-GHJK`. Press Enter, and your browser opens
-momentumgrids.com/cli. Sign in there if asked (email, Apple or Google all
-work), type the code, check the device name, and click **Approve**. Your
-terminal is now signed in.
+momentumgrids.com/cli (or open the link yourself). Sign in there if asked
+(email, Apple or Google all work), type the code, check the device name, and
+click **Approve**. Your terminal is signed in a few seconds later.
 
 > Only approve a code you just got from your own terminal. If someone sends you
 > a code, deny it — approving lets their computer into your account.

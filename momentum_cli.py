@@ -20,6 +20,7 @@ import getpass
 import json
 import os
 import platform
+import select
 import socket
 import subprocess
 import sys
@@ -39,7 +40,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://momentumgrids.com"
 API_PREFIX = "/api/v1/mobile/"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 CLIENT_VERSION = f"cli-{VERSION}"
 # Refresh early so a request never races the 15-minute access-token expiry.
 REFRESH_MARGIN = timedelta(seconds=60)
@@ -508,26 +509,51 @@ def show_code_dialog(code):
     )
 
 
+def wait_for_enter(seconds):
+    """Return True as soon as Enter is pressed, or False after `seconds`."""
+    started = time.monotonic()
+    with contextlib.suppress(OSError, ValueError):
+        if select.select([sys.stdin], [], [], seconds)[0] and sys.stdin.readline():
+            return True
+    # Timed out, or stdin is closed or unselectable: finish the wait unread.
+    time.sleep(max(0, seconds - (time.monotonic() - started)))
+    return False
+
+
+def open_page(url):
+    with contextlib.suppress(Exception):
+        webbrowser.open(url)
+
+
 def login_in_browser(client, out):
     dialogs = []
+    interactive = sys.stdin.isatty()
+    page = {}
 
     def announce(start):
         code, url = start["user_code"], start["verification_uri"]
+        page["url"] = url
         print(f"Your code: {code}", file=out)
         print(f"Approve this terminal at {url} (sign in there if asked).", file=out)
-        if sys.stdin.isatty():
-            with contextlib.suppress(EOFError):
-                input("Press Enter to open the page in your browser… ")
+        if interactive:
+            print("Press Enter to open the page in your browser.", file=out)
         elif sys.platform == "darwin":
             with contextlib.suppress(OSError):
                 dialogs.append(show_code_dialog(code))
         print("Waiting for approval… (Ctrl-C to cancel)", file=out)
         out.flush()
-        with contextlib.suppress(Exception):
-            webbrowser.open(url)
+        if not interactive:
+            open_page(url)
+
+    def wait(seconds):
+        # Keep polling while Enter is optional: people often open the link
+        # themselves, and their approval must still reach this terminal.
+        deadline = time.monotonic() + seconds
+        while wait_for_enter(max(0, deadline - time.monotonic())):
+            open_page(page["url"])
 
     try:
-        client.login_in_browser(announce)
+        client.login_in_browser(announce, sleep=wait if interactive else None)
     finally:
         for dialog in dialogs:
             dialog.terminate()
@@ -1450,6 +1476,11 @@ def cmd_prompt(client, args, out):
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise CLIError("Prompt refresh timed out.")
+                        if url.endswith(API_PREFIX + "auth/refresh/"):
+                            # The server spends the old refresh token as soon as it
+                            # answers; abandoning a slow reply would sign this
+                            # terminal out, so token rotation gets the usual timeout.
+                            return original(method, url, headers, body)
                         if original is urllib_transport:
                             return urllib_transport(method, url, headers, body, timeout=remaining)
                         return original(method, url, headers, body)
